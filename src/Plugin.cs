@@ -7,9 +7,9 @@ using UnityEngine;
 
 namespace OriVR
 {
-    // Build 5: OpenXR diorama. VR starts by itself once the game has a camera, unless VR.AutoStart is false, and if
+    // Build 6: OpenXR diorama with a settings menu. VR starts by itself once the game has a camera, unless VR.AutoStart is false, and if
     // OpenXR cannot start the game stays flat. Telemetry is stopped, because the lab keeps this game offline.
-    [BepInPlugin("com.scubasteve2365.orivr", "OriVR", "0.0.5")]
+    [BepInPlugin("com.scubasteve2365.orivr", "OriVR", "0.0.6")]
     public class Plugin : BaseUnityPlugin
     {
         internal static BepInEx.Logging.ManualLogSource Log;
@@ -19,6 +19,7 @@ namespace OriVR
         string commandFile;
         RenderTests tests;
         XrRig rig;
+        SpeedTest speed;
         internal static int Ticks;
         internal static bool RigActive { get { return instance != null && instance.rig.Active; } }
         static Plugin instance;
@@ -26,7 +27,9 @@ namespace OriVR
         ConfigEntry<float> stageWidth, stageDistance, separation;
         ConfigEntry<int> eyeWidth;
         bool triedAutoStart;
-        bool[] tuneWas = new bool[6];
+        ConfigEntry<float> sharpness;
+        ConfigEntry<bool> matchRefresh;
+        MenuUI menu;
         int ticks;
         int nextCommandCheck;
         int autoProbeFrame = 600;
@@ -39,21 +42,32 @@ namespace OriVR
             commandFile = Path.Combine(Paths.GameRootPath, "vrlab_command.txt");
             tests = gameObject.AddComponent<RenderTests>();
             tests.ShotDir = Path.Combine(Paths.GameRootPath, "vrlab_shots");
+            speed = gameObject.AddComponent<SpeedTest>();
             rig = gameObject.AddComponent<XrRig>();
             rig.PluginDir = Path.GetDirectoryName(Info.Location);
             rig.ShotDir = tests.ShotDir;
             autoStart = Config.Bind("VR", "AutoStart", true, "Start VR by itself once the game has a camera.");
-            stageWidth = Config.Bind("VR", "StageWidth", 2.0f, "Width of the stage in metres. Hold both stick clicks: X smaller, Y larger.");
-            stageDistance = Config.Bind("VR", "StageDistance", 2.0f, "Distance to the stage in metres. Hold both stick clicks: A closer, B further.");
-            separation = Config.Bind("VR", "Separation", 1.0f, "Depth strength, 1 is natural. Hold both stick clicks: LB less, RB more.");
-            eyeWidth = Config.Bind("VR", "EyeWidth", 2560, "Eye image width in pixels. Height follows at 16:9.");
+            stageWidth = Config.Bind("VR", "StageWidth", 2.0f, "Width of the stage in metres.");
+            stageDistance = Config.Bind("VR", "StageDistance", 2.0f, "Distance to the stage in metres.");
+            separation = Config.Bind("VR", "Separation", 1.0f, "Depth strength, 1 is natural.");
+            eyeWidth = Config.Bind("VR", "EyeWidth", 2560, "Starting eye image width in pixels. VR works out the real size from the headset and the stage.");
+            sharpness = Config.Bind("VR", "Sharpness", 1.0f, "1 matches the headset's pixel density across the stage. Higher is sharper and slower.");
+            matchRefresh = Config.Bind("VR", "MatchRefresh", true, "Run one game tick per headset frame, at whatever rate OpenXR reports.");
+            rig.Sharpness = sharpness.Value;
+            rig.MatchRefresh = matchRefresh.Value;
+            menu = gameObject.AddComponent<MenuUI>();
+            menu.Rig = rig;
+            menu.RowText = MenuRowText;
+            menu.Adjust = MenuAdjust;
+            menu.Activate = MenuActivate;
+            menu.Closed = () => { rig.ApplyStage(); rig.UpdateResolution(); };
             rig.StageWidth = stageWidth.Value;
             rig.StageDistance = stageDistance.Value;
             rig.Separation = separation.Value;
             rig.EyeWidth = eyeWidth.Value;
             rig.EyeHeight = eyeWidth.Value * 9 / 16;
             new Harmony("com.scubasteve2365.orivr").PatchAll(typeof(Plugin).Assembly);
-            Log.LogInfo("OriVR build 5 loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
+            Log.LogInfo("OriVR build 6 loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
         }
 
         void FixedUpdate() { ticks++; Ticks = ticks; }
@@ -70,7 +84,6 @@ namespace OriVR
                 triedAutoStart = true;
                 rig.Begin();
             }
-            if (rig.Active) Tune();
             if (autoProbeFrame > 0 && Time.frameCount >= autoProbeFrame)
             {
                 autoProbeFrame = 0;
@@ -78,38 +91,58 @@ namespace OriVR
             }
         }
 
-        // A stand-in until the in-headset menu exists: hold both stick clicks and press a button. Changes are saved.
-        void Tune()
+        string MenuRowText(int row)
         {
-            bool held = SmartInput.XboxControllerInput.GetButton(SmartInput.XboxControllerInput.Button.LeftStick)
-                     && SmartInput.XboxControllerInput.GetButton(SmartInput.XboxControllerInput.Button.RightStick);
-            var keys = new[]
+            switch (row)
             {
-                SmartInput.XboxControllerInput.Button.ButtonA, SmartInput.XboxControllerInput.Button.ButtonB,
-                SmartInput.XboxControllerInput.Button.ButtonX, SmartInput.XboxControllerInput.Button.ButtonY,
-                SmartInput.XboxControllerInput.Button.LeftShoulder, SmartInput.XboxControllerInput.Button.RightShoulder
-            };
-            for (int i = 0; i < keys.Length; i++)
-            {
-                bool down = held && SmartInput.XboxControllerInput.GetButton(keys[i]);
-                if (down && !tuneWas[i]) TuneStep(i);
-                tuneWas[i] = down;
+                case 0: return string.Format("Stage distance: {0:F2} m", stageDistance.Value);
+                case 1: return string.Format("Stage size: {0:F2} m", stageWidth.Value);
+                case 2: return string.Format("Depth: {0:F0}%", separation.Value * 100f);
+                case 3: return string.Format("Sharpness: {0:F0}%   ({1} pixels wide)", sharpness.Value * 100f, rig.WantedWidth());
+                case 4: return "Recenter";
+                case 5: return "Reset to defaults";
+                default: return "Close";
             }
         }
 
-        void TuneStep(int i)
+        void MenuAdjust(int row, int dir)
         {
-            if (i == 0) stageDistance.Value = Mathf.Max(0.5f, stageDistance.Value - 0.1f);
-            if (i == 1) stageDistance.Value = Mathf.Min(10f, stageDistance.Value + 0.1f);
-            if (i == 2) stageWidth.Value = Mathf.Max(0.5f, stageWidth.Value - 0.1f);
-            if (i == 3) stageWidth.Value = Mathf.Min(10f, stageWidth.Value + 0.1f);
-            if (i == 4) separation.Value = Mathf.Max(0f, separation.Value - 0.1f);
-            if (i == 5) separation.Value = Mathf.Min(3f, separation.Value + 0.1f);
+            if (row == 0) stageDistance.Value = Mathf.Clamp(stageDistance.Value + dir * 0.05f, 0.5f, 10f);
+            else if (row == 1) stageWidth.Value = Mathf.Clamp(stageWidth.Value + dir * 0.05f, 0.5f, 10f);
+            else if (row == 2) separation.Value = Mathf.Clamp(separation.Value + dir * 0.05f, 0f, 3f);
+            else if (row == 3) sharpness.Value = Mathf.Clamp(sharpness.Value + dir * 0.1f, 0.5f, 2.5f);
+            else return;
+            PushSettings();
+            Log.LogInfo(string.Format("MENU stage {0:F2} m wide at {1:F2} m, depth {2:F2}, sharpness {3:F2}", stageWidth.Value, stageDistance.Value, separation.Value, sharpness.Value));
+        }
+
+        void MenuActivate(int row)
+        {
+            if (row == 4)
+            {
+                rig.Recenter();
+                Log.LogInfo("MENU recenter");
+            }
+            else if (row == 5)
+            {
+                stageDistance.Value = 2f;
+                stageWidth.Value = 2f;
+                separation.Value = 1f;
+                sharpness.Value = 1f;
+                PushSettings();
+                menu.Refresh();
+                Log.LogInfo("MENU defaults");
+            }
+            else if (row == 6) menu.Close();
+        }
+
+        void PushSettings()
+        {
             rig.StageWidth = stageWidth.Value;
             rig.StageDistance = stageDistance.Value;
             rig.Separation = separation.Value;
+            rig.Sharpness = sharpness.Value;
             rig.ApplyStage();
-            Log.LogInfo(string.Format("TUNE stage {0:F1} m wide at {1:F1} m, separation {2:F1}", stageWidth.Value, stageDistance.Value, separation.Value));
         }
 
         void ReadCommands()
@@ -133,6 +166,13 @@ namespace OriVR
                 else if (line == "vr on") rig.Begin();
                 else if (line == "vr off") rig.End();
                 else if (line == "xrshot") rig.Shot();
+                else if (line == "menu") { if (menu.IsOpen) menu.Close(); else menu.Open(); }
+                else if (line.StartsWith("rate "))
+                {
+                    var parts = line.Split(' ');
+                    speed.SetRate(int.Parse(parts[1]), parts.Length > 2 ? int.Parse(parts[2]) : 0);
+                }
+                else if (line.StartsWith("speed ")) speed.Run(float.Parse(line.Substring(6), System.Globalization.CultureInfo.InvariantCulture));
                 else if (line == "force 0" || line == "force 1") rig.ForceRender = line == "force 1";
                 else if (line == "flip 0" || line == "flip 1") rig.FlipY = line == "flip 1";
                 else if (line == "stamp 0" || line == "stamp 1") rig.Stamp = line == "stamp 1";
@@ -169,6 +209,8 @@ namespace OriVR
             if (cur != null)
             {
                 var c = cur.Camera;
+                var slots = FindObjectOfType<SaveSlotsUI>();
+                Log.LogInfo("SLOTUI " + (slots != null ? slots.CurrentSlotIndex.ToString() : "none"));
                 Log.LogInfo("GAMEPLAY state " + (GameStateMachine.Instance != null ? GameStateMachine.Instance.CurrentState.ToString() : "none") + " ori " + (Game.Characters.Current != null ? Game.Characters.Current.Position.ToString() : "none") + " camera " + c.name + " widthUnits " + cur.CameraWidthWorldUnits.ToString("F2") + " bounds " + cur.CameraBoundingBox);
                 Log.LogInfo("VIEW\n" + c.worldToCameraMatrix);
                 Log.LogInfo("PROJ\n" + c.projectionMatrix);

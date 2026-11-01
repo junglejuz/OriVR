@@ -14,7 +14,7 @@ namespace OriVR
     internal class XrRig : MonoBehaviour
     {
         const string Dll = "OriVRNative";
-        const int EventInit = 1, EventSubmit = 2, EventShutdown = 3;
+        const int EventInit = 1, EventSubmit = 2, EventShutdown = 3, EventResize = 4;
 
         [StructLayout(LayoutKind.Sequential, Pack = 4)]
         struct EyeView { public float px, py, pz, qx, qy, qz, qw, left, right, up, down; }
@@ -33,7 +33,9 @@ namespace OriVR
         // Unity's Mono will not bind a DllImport to a DLL in the plugin folder, so the functions are fetched by hand.
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr GetRenderEventFn();
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int StateFn();
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SetStageFn(float cx, float cy, float cz, float width, float height);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SetStageFn(float cx, float cy, float cz, float width, float height, float qy, float qw);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SetSizeFn(int width, int height);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int RecommendedWidthFn();
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void StartFn(IntPtr left, IntPtr right, int width, int height);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int BeginFrameFn(out FrameInfo info, IntPtr left, IntPtr right);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int PopLogFn(StringBuilder buffer, int size);
@@ -42,6 +44,8 @@ namespace OriVR
         GetRenderEventFn OriXR_GetRenderEvent;
         StateFn OriXR_State;
         SetStageFn OriXR_SetStage;
+        SetSizeFn OriXR_SetSize;
+        RecommendedWidthFn OriXR_RecommendedWidth;
         StartFn OriXR_Start;
         BeginFrameFn OriXR_BeginFrame;
         PopLogFn OriXR_PopLog;
@@ -57,6 +61,15 @@ namespace OriVR
         internal string PluginDir;
         internal string ShotDir;
         internal float StageWidth = 2.0f, StageDistance = 2.0f, Separation = 1.0f;
+        internal float Sharpness = 1.0f;     // 1 matches the headset's pixel density across the stage
+        internal bool MatchRefresh = true;   // run one game tick per headset frame
+
+        // Where the viewer was when the stage was placed, and which way they faced. Eye poses are read relative to this.
+        Vector3 viewPoint;
+        Quaternion viewTurn = Quaternion.identity;
+        bool wantRecenter = true;
+        float eyeTanSpan;  // width of the headset's eye view on a flat plane one metre away
+        float savedFixed = -1f, savedMax;
         internal int EyeWidth = 2560, EyeHeight = 1440;
         internal bool FlipY = true, Stamp, Mirror = true;
         internal bool ForceRender;  // lab test: keep rendering eyes when the runtime is not asking for images
@@ -94,6 +107,8 @@ namespace OriVR
             OriXR_GetRenderEvent = Fn<GetRenderEventFn>(module, "OriXR_GetRenderEvent");
             OriXR_State = Fn<StateFn>(module, "OriXR_State");
             OriXR_SetStage = Fn<SetStageFn>(module, "OriXR_SetStage");
+            OriXR_SetSize = Fn<SetSizeFn>(module, "OriXR_SetSize");
+            OriXR_RecommendedWidth = Fn<RecommendedWidthFn>(module, "OriXR_RecommendedWidth");
             OriXR_Start = Fn<StartFn>(module, "OriXR_Start");
             OriXR_BeginFrame = Fn<BeginFrameFn>(module, "OriXR_BeginFrame");
             OriXR_PopLog = Fn<PopLogFn>(module, "OriXR_PopLog");
@@ -144,6 +159,12 @@ namespace OriVR
             if (!active) return;
             active = false;
             ShowFlat();
+            if (savedFixed >= 0f)
+            {
+                Time.fixedDeltaTime = savedFixed;
+                Time.maximumDeltaTime = savedMax;
+                savedFixed = -1f;
+            }
             Application.targetFrameRate = savedTargetFps;
             QualitySettings.vSyncCount = savedVsync;
             GL.IssuePluginEvent(renderEvent, EventShutdown);
@@ -151,6 +172,78 @@ namespace OriVR
         }
 
         internal void Shot() { wantShot = true; }
+
+        internal void Recenter() { wantRecenter = true; }
+
+        internal int WantedWidth()
+        {
+            int rec = OriXR_RecommendedWidth != null ? OriXR_RecommendedWidth() : 0;
+            if (rec <= 0 || eyeTanSpan <= 0f) return EyeWidth;
+            // The stage is flat, so pixel density across it compares directly with the headset's flat eye image.
+            int w = Mathf.RoundToInt(rec * (StageWidth / StageDistance) / eyeTanSpan * Sharpness);
+            return Mathf.Clamp(w / 16 * 16, 1280, 6144);
+        }
+
+        // Rebuilds the eye textures when the stage or sharpness calls for a size more than 3 percent away.
+        internal void UpdateResolution()
+        {
+            if (!active || OriXR_State() != 2) return;
+            int w = WantedWidth();
+            if (Mathf.Abs(w - EyeWidth) <= EyeWidth * 0.03f) return;
+            Resize(w);
+        }
+
+        void Resize(int width)
+        {
+            int height = width * 9 / 16;
+            for (int i = 0; i < 2; i++)
+            {
+                var r = eyeRender[i];
+                var o = eyeOut[i];
+                eyeRender[i] = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32);
+                eyeRender[i].name = "OriVR eye render " + i;
+                eyeRender[i].Create();
+                eyeOut[i] = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32);
+                eyeOut[i].name = "OriVR eye out " + i;
+                eyeOut[i].Create();
+                Destroy(r);  // frames already queued hold their own reference to the old texture
+                Destroy(o);
+            }
+            EyeWidth = width;
+            EyeHeight = height;
+            OriXR_SetSize(width, height);
+            GL.IssuePluginEvent(renderEvent, EventResize);
+            ApplyStage();
+            Plugin.Log.LogInfo(string.Format("RESOLUTION eye {0}x{1}, stage {2:F2} m at {3:F2} m, sharpness {4:F2}", width, height, StageWidth, StageDistance, Sharpness));
+        }
+
+        void MatchTick(float periodMs)
+        {
+            if (!MatchRefresh || periodMs <= 0f) return;
+            float period = periodMs / 1000f;
+            if (Mathf.Abs(Time.fixedDeltaTime - period) < 0.00002f) return;
+            if (savedFixed < 0f)
+            {
+                savedFixed = Time.fixedDeltaTime;
+                savedMax = Time.maximumDeltaTime;
+            }
+            Time.fixedDeltaTime = period;
+            Time.maximumDeltaTime = period;
+            Plugin.Log.LogInfo(string.Format("REFRESH headset {0:F2} Hz, one game tick per frame", 1f / period));
+        }
+
+        void TakeView(FrameInfo info)
+        {
+            var a = new Vector3(info.eye0.px, info.eye0.py, info.eye0.pz);
+            var b = new Vector3(info.eye1.px, info.eye1.py, info.eye1.pz);
+            viewPoint = (a + b) * 0.5f;
+            var forward = new Quaternion(info.eye0.qx, info.eye0.qy, info.eye0.qz, info.eye0.qw) * new Vector3(0f, 0f, -1f);
+            viewTurn = Quaternion.Euler(0f, Mathf.Atan2(-forward.x, -forward.z) * Mathf.Rad2Deg, 0f);
+            eyeTanSpan = Mathf.Tan(info.eye0.right) - Mathf.Tan(info.eye0.left);
+            ApplyStage();
+            Plugin.Log.LogInfo("headset recommends " + OriXR_RecommendedWidth() + " wide over " + eyeTanSpan.ToString("F2") + " of flat view");
+            Plugin.Log.LogInfo(string.Format("RECENTER view ({0:F2},{1:F2},{2:F2}), turned {3:F0} degrees", viewPoint.x, viewPoint.y, viewPoint.z, viewTurn.eulerAngles.y));
+        }
 
         void ShowFlat()
         {
@@ -161,7 +254,9 @@ namespace OriVR
 
         internal void ApplyStage()
         {
-            if (nativeLoaded) OriXR_SetStage(0f, 0f, -StageDistance, StageWidth, StageWidth * EyeHeight / EyeWidth);
+            if (!nativeLoaded) return;
+            var c = viewPoint + viewTurn * new Vector3(0f, 0f, -StageDistance);
+            OriXR_SetStage(c.x, c.y, c.z, StageWidth, StageWidth * EyeHeight / EyeWidth, viewTurn.y, viewTurn.w);
         }
 
         void Update()
@@ -214,6 +309,13 @@ namespace OriVR
                     ShowFlat();
                     continue;
                 }
+                MatchTick(info.periodMs);
+                if (info.viewsValid != 0 && wantRecenter)
+                {
+                    wantRecenter = false;
+                    TakeView(info);
+                    UpdateResolution();
+                }
                 if (info.shouldRender != 0 || ForceRender) RenderEyes(cur, info);
                 else ShowFlat();
                 GL.IssuePluginEvent(renderEvent, EventSubmit);
@@ -225,7 +327,7 @@ namespace OriVR
                     OriXR_Stats(out frames, out layers, out skipped);
                     float span = now - (nextStat - 5f);
                     Plugin.Log.LogInfo(string.Format("XRSTAT state {0} shouldRender {1} period {2:F2} ms, unity {3:F1} fps, ticks {4:F1}/s, submitted {5}, with images {6}, skipped {7}, pairs {8}",
-                        info.sessionState, info.shouldRender, info.periodMs, (Time.frameCount - framesAtStat) / span, (Plugin.Ticks - ticksAtStat) / span, frames, layers, skipped, renderedPairs));
+                        info.sessionState, info.shouldRender, info.periodMs, (Time.frameCount - framesAtStat) / span, (Plugin.Ticks - ticksAtStat) / span, frames, layers, skipped, renderedPairs + " eye " + EyeWidth));
                     nextStat = now + 5f;
                     ticksAtStat = Plugin.Ticks;
                     framesAtStat = Time.frameCount;
@@ -257,12 +359,12 @@ namespace OriVR
             {
                 var e = i == 0 ? info.eye0 : info.eye1;
                 // Without valid tracking, stand at the stage's normal viewing spot with a fixed eye gap.
-                float ex = info.viewsValid != 0 ? e.px : (i == 0 ? -0.0315f : 0.0315f);
-                float ey = info.viewsValid != 0 ? e.py : 0f;
-                float ez = info.viewsValid != 0 ? e.pz : 0f;
-                float x = ex * unitsPerMetre * Separation;
-                float y = ey * unitsPerMetre * Separation;
-                float eyeDist = Mathf.Max(dist + ez * unitsPerMetre, dist * 0.25f);
+                var local = info.viewsValid != 0
+                    ? Quaternion.Inverse(viewTurn) * (new Vector3(e.px, e.py, e.pz) - viewPoint)
+                    : new Vector3(i == 0 ? -0.0315f : 0.0315f, 0f, 0f);
+                float x = local.x * unitsPerMetre * Separation;
+                float y = local.y * unitsPerMetre * Separation;
+                float eyeDist = Mathf.Max(dist + local.z * unitsPerMetre, dist * 0.25f);
 
                 cam.worldToCameraMatrix = Matrix4x4.TRS(new Vector3(-x, -y, -(eyeDist - dist)), Quaternion.identity, Vector3.one) * view;
                 cam.projectionMatrix = RenderTests.EyeProjection(cam, x, y, eyeDist);

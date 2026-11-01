@@ -25,7 +25,7 @@
 #define API extern "C" __declspec(dllexport)
 
 enum State { StateOff = 0, StateStarting = 1, StateReady = 2, StateFailed = 3 };
-enum Event { EventInit = 1, EventSubmit = 2, EventShutdown = 3 };
+enum Event { EventInit = 1, EventSubmit = 2, EventShutdown = 3, EventResize = 4 };
 
 #pragma pack(push, 4)
 struct EyeView { float px, py, pz, qx, qy, qz, qw, left, right, up, down; };
@@ -68,7 +68,12 @@ static ID3D11Device* g_dev;
 static ID3D11DeviceContext* g_ctx;
 static ID3D11Texture2D* g_src[2];
 static int g_w, g_h;
-static float g_stage[5] = {0, 0, -2, 2, 1.125f};  // centre x, y, z, width, height in metres
+static float g_stage[7] = {0, 0, -2, 2, 1.125f, 0, 1};  // centre x, y, z, width, height in metres, turn as quaternion y, w
+static int g_recW, g_recH, g_newW, g_newH;
+static int64_t g_format;
+static PFN_xrCreateSwapchain p_createSwap;
+static PFN_xrEnumerateSwapchainImages p_enumImages;
+static PFN_xrDestroySwapchain p_destroySwap;
 static std::mutex g_frameLock;
 static std::deque<PendingFrame> g_frames;
 static unsigned long long g_submitted, g_submittedLayers, g_skippedAcquire;
@@ -103,6 +108,32 @@ static void HereDir(char* path, DWORD size) {
     GetModuleFileNameA(self, path, size);
     char* slash = strrchr(path, '\\');
     if (slash) slash[1] = 0;
+}
+
+static bool CreateSwapchains() {
+    for (int e = 0; e < 2; e++) {
+        XrSwapchainCreateInfo c{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        c.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        c.format = g_format;
+        c.sampleCount = 1;
+        c.width = g_w;
+        c.height = g_h;
+        c.faceCount = c.arraySize = c.mipCount = 1;
+        XRCHECK(p_createSwap(g_sess, &c, &g_swap[e].handle));
+        uint32_t ic = 0;
+        XRCHECK(p_enumImages(g_swap[e].handle, 0, &ic, nullptr));
+        g_swap[e].images.assign(ic, XrSwapchainImageD3D11KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+        XRCHECK(p_enumImages(g_swap[e].handle, ic, &ic, (XrSwapchainImageBaseHeader*)g_swap[e].images.data()));
+    }
+    Log("swapchains %dx%d, %zu images per eye", g_w, g_h, g_swap[0].images.size());
+    return true;
+}
+
+static void DoResize() {
+    for (auto& sw : g_swap) if (sw.handle) { p_destroySwap(sw.handle); sw.handle = XR_NULL_HANDLE; }
+    g_w = g_newW;
+    g_h = g_newH;
+    if (!CreateSwapchains()) { Log("resize failed, OpenXR stops"); g_state = StateFailed; }
 }
 
 static bool StartXr() {
@@ -191,24 +222,20 @@ static bool StartXr() {
     if (!format) { Log("the runtime offers no RGBA8 swapchain format"); return false; }
     Log("swapchain format %d", (int)format);
 
-    PFN_xrCreateSwapchain createSwap;
-    PFN_xrEnumerateSwapchainImages enumImages;
-    if (!GetFn("xrCreateSwapchain", createSwap) || !GetFn("xrEnumerateSwapchainImages", enumImages)) return false;
-    for (int e = 0; e < 2; e++) {
-        XrSwapchainCreateInfo c{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        c.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-        c.format = format;
-        c.sampleCount = 1;
-        c.width = g_w;
-        c.height = g_h;
-        c.faceCount = c.arraySize = c.mipCount = 1;
-        XRCHECK(createSwap(g_sess, &c, &g_swap[e].handle));
-        uint32_t ic = 0;
-        XRCHECK(enumImages(g_swap[e].handle, 0, &ic, nullptr));
-        g_swap[e].images.assign(ic, XrSwapchainImageD3D11KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-        XRCHECK(enumImages(g_swap[e].handle, ic, &ic, (XrSwapchainImageBaseHeader*)g_swap[e].images.data()));
+    g_format = format;
+    if (!GetFn("xrCreateSwapchain", p_createSwap) || !GetFn("xrEnumerateSwapchainImages", p_enumImages) || !GetFn("xrDestroySwapchain", p_destroySwap)) return false;
+
+    PFN_xrEnumerateViewConfigurationViews enumViews;
+    if (GetFn("xrEnumerateViewConfigurationViews", enumViews)) {
+        XrViewConfigurationView v[2] = {XrViewConfigurationView{XR_TYPE_VIEW_CONFIGURATION_VIEW}, XrViewConfigurationView{XR_TYPE_VIEW_CONFIGURATION_VIEW}};
+        uint32_t vc = 0;
+        if (XR_SUCCEEDED(enumViews(g_inst, g_sys, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &vc, v))) {
+            g_recW = (int)v[0].recommendedImageRectWidth;
+            g_recH = (int)v[0].recommendedImageRectHeight;
+            Log("headset recommends %dx%d per eye", g_recW, g_recH);
+        }
     }
-    Log("swapchains %dx%d, %zu images per eye", g_w, g_h, g_swap[0].images.size());
+    if (!CreateSwapchains()) return false;
 
     return GetFn("xrPollEvent", p_poll) && GetFn("xrBeginSession", p_beginSession) && GetFn("xrEndSession", p_endSession) &&
            GetFn("xrWaitFrame", p_waitFrame) && GetFn("xrBeginFrame", p_beginFrame) && GetFn("xrEndFrame", p_endFrame) &&
@@ -249,7 +276,8 @@ static bool CopyEye(int e, ID3D11Texture2D* src, XrCompositionLayerQuad& quad) {
     quad.eyeVisibility = e == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
     quad.subImage.swapchain = g_swap[e].handle;
     quad.subImage.imageRect.extent = {g_w, g_h};
-    quad.pose.orientation.w = 1.0f;
+    quad.pose.orientation.y = g_stage[5];
+    quad.pose.orientation.w = g_stage[6];
     quad.pose.position = {g_stage[0], g_stage[1], g_stage[2]};
     quad.size = {g_stage[3], g_stage[4]};
     return true;
@@ -295,6 +323,7 @@ static void DoShutdown() {
         PFN_xrDestroyInstance destroy;
         if (GetFn("xrDestroyInstance", destroy)) destroy(g_inst);  // takes the session, spaces and swapchains with it
     }
+    for (auto& sw : g_swap) sw.handle = XR_NULL_HANDLE;
     g_inst = XR_NULL_HANDLE;
     g_sess = XR_NULL_HANDLE;
     g_space = XR_NULL_HANDLE;
@@ -308,15 +337,20 @@ static void DoShutdown() {
 static void __stdcall RenderEvent(int id) {
     if (id == EventInit && g_state == StateStarting) DoInit();
     else if (id == EventSubmit && g_state == StateReady) DoSubmit();
+    else if (id == EventResize && g_state == StateReady) DoResize();
     else if (id == EventShutdown && g_state != StateOff) DoShutdown();
 }
 
 API void* OriXR_GetRenderEvent() { return (void*)RenderEvent; }
 API int OriXR_State() { return (int)g_state; }
 
-API void OriXR_SetStage(float cx, float cy, float cz, float width, float height) {
-    g_stage[0] = cx; g_stage[1] = cy; g_stage[2] = cz; g_stage[3] = width; g_stage[4] = height;
+API void OriXR_SetStage(float cx, float cy, float cz, float width, float height, float qy, float qw) {
+    g_stage[0] = cx; g_stage[1] = cy; g_stage[2] = cz; g_stage[3] = width; g_stage[4] = height; g_stage[5] = qy; g_stage[6] = qw;
 }
+
+// Takes effect with the next resize event on the render thread.
+API void OriXR_SetSize(int width, int height) { g_newW = width; g_newH = height; }
+API int OriXR_RecommendedWidth() { return g_recW; }
 
 // Call on the main thread before the init event. The textures must already exist in the Unity player.
 API void OriXR_Start(void* left, void* right, int width, int height) {
