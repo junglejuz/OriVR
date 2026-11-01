@@ -29,6 +29,38 @@ namespace OriVR
             StartCoroutine(CompareRoutine());
         }
 
+        internal void Sizes()
+        {
+            if (!Busy) StartCoroutine(SizesRoutine());
+        }
+
+        // One frame rendered at several widths, to see where more pixels stop adding detail.
+        IEnumerator SizesRoutine()
+        {
+            Busy = true;
+            yield return new WaitForEndOfFrame();
+            var cam = GameCamera();
+            if (cam != null)
+            {
+                Plugin.Log.LogInfo(string.Format("QUALITY masterTextureLimit {0} anisotropic {1} antiAliasing {2} name {3} motionBlur {4}", QualitySettings.masterTextureLimit, QualitySettings.anisotropicFiltering, QualitySettings.antiAliasing, QualitySettings.names[QualitySettings.GetQualityLevel()], GameSettings.Instance != null && GameSettings.Instance.MotionBlurEnabled));
+                int frame = Time.frameCount;
+                foreach (int w in new[] { 1280, 1920, 2560, 3840, 5120 })
+                {
+                    var rt = new RenderTexture(w, w * 9 / 16, 24, RenderTextureFormat.ARGB32);
+                    // Twice, so the second has an alpha buffer from this same size and sway.
+                    var first = Grab(cam, rt);
+                    Destroy(first);
+                    var tex = Grab(cam, rt);
+                    Save("size_" + w, tex);
+                    Destroy(tex);
+                    rt.Release();
+                    Destroy(rt);
+                }
+                Plugin.Log.LogInfo("SIZES done, same frame " + (Time.frameCount == frame));
+            }
+            Busy = false;
+        }
+
         internal void Stereo(float separation)
         {
             if (!Busy) StartCoroutine(StereoRoutine(separation));

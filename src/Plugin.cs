@@ -162,6 +162,7 @@ namespace OriVR
                 Log.LogInfo("command: " + line);
                 if (line == "probe") Probe();
                 else if (line == "compare") tests.Compare();
+                else if (line == "sizes") tests.Sizes();
                 else if (line == "compare2") tests.CompareSameSway();
                 else if (line == "vr on") rig.Begin();
                 else if (line == "vr off") rig.End();
