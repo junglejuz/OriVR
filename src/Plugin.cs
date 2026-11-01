@@ -7,9 +7,9 @@ using UnityEngine;
 
 namespace OriVR
 {
-    // Build 1: read-only probe. It reads the game's state and logs it. The only change it makes to the game
-    // is stopping telemetry, because the lab keeps this game offline.
-    [BepInPlugin("com.scubasteve2365.orivr", "OriVR", "0.0.1")]
+    // Build 3: read-only probe plus one-shot render tests. The picture on screen is not changed. The only change
+    // it makes to the game is stopping telemetry, because the lab keeps this game offline.
+    [BepInPlugin("com.scubasteve2365.orivr", "OriVR", "0.0.3")]
     public class Plugin : BaseUnityPlugin
     {
         internal static BepInEx.Logging.ManualLogSource Log;
@@ -17,6 +17,7 @@ namespace OriVR
         internal static int TelemetryBlocked;
 
         string commandFile;
+        RenderTests tests;
         int ticks;
         int nextCommandCheck;
         int autoProbeFrame = 600;
@@ -26,8 +27,10 @@ namespace OriVR
             Log = Logger;
             BlockTelemetry = Config.Bind("Network", "BlockTelemetry", true, "Stop the game sending telemetry to its server.");
             commandFile = Path.Combine(Paths.GameRootPath, "vrlab_command.txt");
+            tests = gameObject.AddComponent<RenderTests>();
+            tests.ShotDir = Path.Combine(Paths.GameRootPath, "vrlab_shots");
             new Harmony("com.scubasteve2365.orivr").PatchAll(typeof(Plugin).Assembly);
-            Log.LogInfo("OriVR build 1 loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
+            Log.LogInfo("OriVR build 3 loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
         }
 
         void FixedUpdate() { ticks++; }
@@ -62,6 +65,19 @@ namespace OriVR
                 if (line.Length == 0) continue;
                 Log.LogInfo("command: " + line);
                 if (line == "probe") Probe();
+                else if (line == "compare") tests.Compare();
+                else if (line == "freeze 1" || line == "freeze 0")
+                {
+                    RenderTests.FreezeTurbulenceSetting = line == "freeze 1";
+                    Log.LogInfo("freeze turbulence during our renders: " + RenderTests.FreezeTurbulenceSetting);
+                }
+                else if (line.StartsWith("stereo "))
+                {
+                    float sep;
+                    try { sep = float.Parse(line.Substring(7), System.Globalization.CultureInfo.InvariantCulture); }
+                    catch (System.FormatException) { Log.LogWarning("bad number: " + line); continue; }
+                    tests.Stereo(sep);
+                }
                 else Log.LogWarning("unknown command: " + line);
             }
         }
@@ -83,7 +99,7 @@ namespace OriVR
             if (cur != null)
             {
                 var c = cur.Camera;
-                Log.LogInfo("GAMEPLAY camera " + c.name + " widthUnits " + cur.CameraWidthWorldUnits.ToString("F2") + " bounds " + cur.CameraBoundingBox);
+                Log.LogInfo("GAMEPLAY state " + (GameStateMachine.Instance != null ? GameStateMachine.Instance.CurrentState.ToString() : "none") + " ori " + (Game.Characters.Current != null ? Game.Characters.Current.Position.ToString() : "none") + " camera " + c.name + " widthUnits " + cur.CameraWidthWorldUnits.ToString("F2") + " bounds " + cur.CameraBoundingBox);
                 Log.LogInfo("VIEW\n" + c.worldToCameraMatrix);
                 Log.LogInfo("PROJ\n" + c.projectionMatrix);
             }
@@ -102,5 +118,13 @@ namespace OriVR
             Plugin.TelemetryBlocked++;
             return false;
         }
+    }
+
+    // TurbulenceManager.OnRenderObject moves the plant sway on by real time at every render of the main camera
+    // (decomp TurbulenceManager.cs). The second eye must see the sway the first eye saw, so our extra renders skip it.
+    [HarmonyPatch(typeof(TurbulenceManager), "OnRenderObject")]
+    static class TurbulencePatch
+    {
+        static bool Prefix() { return !RenderTests.SkipTurbulenceNow; }
     }
 }
