@@ -7,9 +7,9 @@ using UnityEngine;
 
 namespace OriVR
 {
-    // Build 6: OpenXR diorama with a settings menu. VR starts by itself once the game has a camera, unless VR.AutoStart is false, and if
+    // Build 7: OpenXR diorama with a settings menu. VR starts by itself once the game has a camera, unless VR.AutoStart is false, and if
     // OpenXR cannot start the game stays flat. Telemetry is stopped, because the lab keeps this game offline.
-    [BepInPlugin("com.scubasteve2365.orivr", "OriVR", "0.0.6")]
+    [BepInPlugin("com.scubasteve2365.orivr", "OriVR", "0.0.7")]
     public class Plugin : BaseUnityPlugin
     {
         internal static BepInEx.Logging.ManualLogSource Log;
@@ -27,7 +27,9 @@ namespace OriVR
         ConfigEntry<float> stageWidth, stageDistance, separation;
         ConfigEntry<int> eyeWidth;
         bool triedAutoStart;
-        ConfigEntry<float> sharpness;
+        ConfigEntry<float> sharpness, popOut, sharpen;
+        LabTools lab;
+        const float DefaultWidth = 1.85f, DefaultDistance = 1.0f, DefaultDepth = 1.5f, DefaultSharpen = 0.3f;
         ConfigEntry<bool> matchRefresh;
         MenuUI menu;
         int ticks;
@@ -47,11 +49,16 @@ namespace OriVR
             rig.PluginDir = Path.GetDirectoryName(Info.Location);
             rig.ShotDir = tests.ShotDir;
             autoStart = Config.Bind("VR", "AutoStart", true, "Start VR by itself once the game has a camera.");
-            stageWidth = Config.Bind("VR", "StageWidth", 2.0f, "Width of the stage in metres.");
-            stageDistance = Config.Bind("VR", "StageDistance", 2.0f, "Distance to the stage in metres.");
-            separation = Config.Bind("VR", "Separation", 1.0f, "Depth strength, 1 is natural.");
+            stageWidth = Config.Bind("VR", "StageWidth", DefaultWidth, "Width of the stage in metres.");
+            stageDistance = Config.Bind("VR", "StageDistance", DefaultDistance, "Distance to the stage in metres.");
+            separation = Config.Bind("VR", "Separation", DefaultDepth, "Depth strength, 1 is natural.");
             eyeWidth = Config.Bind("VR", "EyeWidth", 2560, "Starting eye image width in pixels. VR works out the real size from the headset and the stage.");
-            sharpness = Config.Bind("VR", "Sharpness", 1.0f, "1 matches the headset's pixel density across the stage. Higher is sharper and slower.");
+            sharpness = Config.Bind("VR", "ResolutionScale", 1.0f, "1 matches the headset's pixel density across the stage.");
+            popOut = Config.Bind("VR", "PopOut", 0f, "0 keeps the gameplay layer on the stage. Higher brings more of the scene toward you.");
+            sharpen = Config.Bind("VR", "Sharpen", DefaultSharpen, "Strength of the sharpening pass, 0 is off.");
+            rig.PopOut = popOut.Value;
+            rig.Sharpen = sharpen.Value;
+            lab = gameObject.AddComponent<LabTools>();
             matchRefresh = Config.Bind("VR", "MatchRefresh", true, "Run one game tick per headset frame, at whatever rate OpenXR reports.");
             rig.Sharpness = sharpness.Value;
             rig.MatchRefresh = matchRefresh.Value;
@@ -67,7 +74,7 @@ namespace OriVR
             rig.EyeWidth = eyeWidth.Value;
             rig.EyeHeight = eyeWidth.Value * 9 / 16;
             new Harmony("com.scubasteve2365.orivr").PatchAll(typeof(Plugin).Assembly);
-            Log.LogInfo("OriVR build 6 loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
+            Log.LogInfo("OriVR build 7 loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
         }
 
         void FixedUpdate() { ticks++; Ticks = ticks; }
@@ -98,9 +105,11 @@ namespace OriVR
                 case 0: return string.Format("Stage distance: {0:F2} m", stageDistance.Value);
                 case 1: return string.Format("Stage size: {0:F2} m", stageWidth.Value);
                 case 2: return string.Format("Depth: {0:F0}%", separation.Value * 100f);
-                case 3: return string.Format("Sharpness: {0:F0}%   ({1} pixels wide)", sharpness.Value * 100f, rig.WantedWidth());
-                case 4: return "Recenter";
-                case 5: return "Reset to defaults";
+                case 3: return string.Format("Pop-out: {0:F0}%", popOut.Value * 100f);
+                case 4: return string.Format("Sharpen: {0:F0}%", sharpen.Value * 100f);
+                case 5: return string.Format("Resolution: {0:F0}%   ({1} pixels wide)", sharpness.Value * 100f, rig.WantedWidth());
+                case 6: return "Recenter";
+                case 7: return "Reset to defaults";
                 default: return "Close";
             }
         }
@@ -110,30 +119,34 @@ namespace OriVR
             if (row == 0) stageDistance.Value = Mathf.Clamp(stageDistance.Value + dir * 0.05f, 0.5f, 10f);
             else if (row == 1) stageWidth.Value = Mathf.Clamp(stageWidth.Value + dir * 0.05f, 0.5f, 10f);
             else if (row == 2) separation.Value = Mathf.Clamp(separation.Value + dir * 0.05f, 0f, 3f);
-            else if (row == 3) sharpness.Value = Mathf.Clamp(sharpness.Value + dir * 0.1f, 0.5f, 2.5f);
+            else if (row == 3) popOut.Value = Mathf.Clamp(popOut.Value + dir * 0.05f, 0f, 1f);
+            else if (row == 4) sharpen.Value = Mathf.Clamp(sharpen.Value + dir * 0.1f, 0f, 1f);
+            else if (row == 5) sharpness.Value = Mathf.Clamp(sharpness.Value + dir * 0.1f, 0.5f, 1.5f);
             else return;
             PushSettings();
-            Log.LogInfo(string.Format("MENU stage {0:F2} m wide at {1:F2} m, depth {2:F2}, sharpness {3:F2}", stageWidth.Value, stageDistance.Value, separation.Value, sharpness.Value));
+            Log.LogInfo(string.Format("MENU stage {0:F2} m wide at {1:F2} m, depth {2:F2}, pop-out {3:F2}, sharpen {4:F2}, resolution {5:F2}", stageWidth.Value, stageDistance.Value, separation.Value, popOut.Value, sharpen.Value, sharpness.Value));
         }
 
         void MenuActivate(int row)
         {
-            if (row == 4)
+            if (row == 6)
             {
                 rig.Recenter();
                 Log.LogInfo("MENU recenter");
             }
-            else if (row == 5)
+            else if (row == 7)
             {
-                stageDistance.Value = 2f;
-                stageWidth.Value = 2f;
-                separation.Value = 1f;
+                stageDistance.Value = DefaultDistance;
+                stageWidth.Value = DefaultWidth;
+                separation.Value = DefaultDepth;
+                popOut.Value = 0f;
+                sharpen.Value = DefaultSharpen;
                 sharpness.Value = 1f;
                 PushSettings();
                 menu.Refresh();
                 Log.LogInfo("MENU defaults");
             }
-            else if (row == 6) menu.Close();
+            else if (row == 8) menu.Close();
         }
 
         void PushSettings()
@@ -142,6 +155,8 @@ namespace OriVR
             rig.StageDistance = stageDistance.Value;
             rig.Separation = separation.Value;
             rig.Sharpness = sharpness.Value;
+            rig.PopOut = popOut.Value;
+            rig.Sharpen = sharpen.Value;
             rig.ApplyStage();
         }
 
@@ -167,6 +182,16 @@ namespace OriVR
                 else if (line == "vr on") rig.Begin();
                 else if (line == "vr off") rig.End();
                 else if (line == "xrshot") rig.Shot();
+                else if (line == "eyecheck") rig.EyeCheck();
+                else if (line == "fixes 0" || line == "fixes 1") rig.StereoFixes = line == "fixes 1";
+                else if (line.StartsWith("dump ")) rig.Dump(Path.Combine(tests.ShotDir, line.Substring(5)));
+                else if (line.StartsWith("sharpen ")) { sharpen.Value = float.Parse(line.Substring(8), System.Globalization.CultureInfo.InvariantCulture); PushSettings(); }
+                else if (line.StartsWith("popout ")) { popOut.Value = float.Parse(line.Substring(7), System.Globalization.CultureInfo.InvariantCulture); PushSettings(); }
+                else if (line.StartsWith("depth ")) { separation.Value = float.Parse(line.Substring(6), System.Globalization.CultureInfo.InvariantCulture); PushSettings(); }
+                else if (line.StartsWith("stage ")) { var v = line.Split(' '); stageWidth.Value = float.Parse(v[1], System.Globalization.CultureInfo.InvariantCulture); stageDistance.Value = float.Parse(v[2], System.Globalization.CultureInfo.InvariantCulture); PushSettings(); rig.UpdateResolution(); }
+                else if (line.StartsWith("scenes ")) lab.ListScenes(line.Substring(7));
+                else if (line.StartsWith("goto ")) lab.GoTo(line.Substring(5));
+                else if (line.StartsWith("crossfade ")) lab.CrossFade(float.Parse(line.Substring(10), System.Globalization.CultureInfo.InvariantCulture));
                 else if (line == "menu") { if (menu.IsOpen) menu.Close(); else menu.Open(); }
                 else if (line.StartsWith("rate "))
                 {
@@ -266,6 +291,67 @@ namespace OriVR
         static void Prefix(ref bool focusStatus)
         {
             if (Plugin.RigActive) focusStatus = true;
+        }
+    }
+
+    // Cross fades alternate two views frame by frame and blend with the last one kept in a buffer. With VR on, each eye
+    // needs its own buffer, the empty flat render must not take part, and the alternation moves on once per frame.
+    [HarmonyPatch(typeof(UberPostProcessingCrossFade), "OnRenderImage")]
+    static class CrossFadePatch
+    {
+        static readonly RenderTexture[] Buffers = new RenderTexture[2];
+        internal static readonly bool[] Used = new bool[2];
+        static readonly System.Reflection.FieldInfo CurrentField = AccessTools.Field(typeof(UberPostProcessingCrossFade), "m_currentFrame");
+        static readonly System.Reflection.FieldInfo NextField = AccessTools.Field(typeof(UberPostProcessingCrossFade), "m_nextFrame");
+        static readonly System.Reflection.FieldInfo CounterField = AccessTools.Field(typeof(UberPostProcessingCrossFade), "m_frameCounter");
+
+        internal static int CurrentView(UberPostProcessingCrossFade fade) { return (int)CurrentField.GetValue(fade) == 1 ? 1 : 0; }
+
+        static bool Prefix(UberPostProcessingCrossFade __instance, RenderTexture from, RenderTexture to)
+        {
+            if (!XrRig.SuppressFlat) return true;
+            if (!XrRig.InEyeRender)
+            {
+                Graphics.Blit(from, to);
+                return false;
+            }
+            int eye = XrRig.EyeIndex;
+            var buffer = Buffers[eye];
+            if (buffer == null || buffer.width != from.width || buffer.height != from.height)
+            {
+                if (buffer != null) UnityEngine.Object.Destroy(buffer);
+                buffer = new RenderTexture(from.width, from.height, 0, RenderTextureFormat.ARGB32);
+                Buffers[eye] = buffer;
+                Used[eye] = false;
+            }
+            int current = (int)CurrentField.GetValue(__instance);
+            int next = (int)NextField.GetValue(__instance);
+            var mat = __instance.Material;
+            float alpha = current == 1 ? 1f - __instance.TweenTime : __instance.TweenTime;
+            mat.SetFloat(UberPostCacheIds.Alpha, Used[eye] ? alpha : 0f);
+            mat.SetTexture(UberPostCacheIds.Buf, buffer);
+            Graphics.Blit(from, to, mat);
+            if (current != next)
+            {
+                Graphics.Blit(from, buffer);
+                Used[eye] = true;
+            }
+            if (eye == 1)
+            {
+                CurrentField.SetValue(__instance, next);
+                CounterField.SetValue(__instance, (int)CounterField.GetValue(__instance) + 1);
+            }
+            return false;
+        }
+    }
+
+    [HarmonyPatch(typeof(UberPostProcessingCrossFade), "StartCrossFade")]
+    static class CrossFadeStartPatch
+    {
+        static void Postfix()
+        {
+            CrossFadePatch.Used[0] = false;
+            CrossFadePatch.Used[1] = false;
         }
     }
 }

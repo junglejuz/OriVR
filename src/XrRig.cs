@@ -35,6 +35,8 @@ namespace OriVR
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int StateFn();
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SetStageFn(float cx, float cy, float cz, float width, float height, float qy, float qw);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SetSizeFn(int width, int height);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SetSharpenFn(float amount);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void DumpNextFn([MarshalAs(UnmanagedType.LPStr)] string basePath);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int RecommendedWidthFn();
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void StartFn(IntPtr left, IntPtr right, int width, int height);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int BeginFrameFn(out FrameInfo info, IntPtr left, IntPtr right);
@@ -45,6 +47,8 @@ namespace OriVR
         StateFn OriXR_State;
         SetStageFn OriXR_SetStage;
         SetSizeFn OriXR_SetSize;
+        SetSharpenFn OriXR_SetSharpen;
+        DumpNextFn OriXR_DumpNext;
         RecommendedWidthFn OriXR_RecommendedWidth;
         StartFn OriXR_Start;
         BeginFrameFn OriXR_BeginFrame;
@@ -61,7 +65,10 @@ namespace OriVR
         internal string PluginDir;
         internal string ShotDir;
         internal float StageWidth = 2.0f, StageDistance = 2.0f, Separation = 1.0f;
-        internal float Sharpness = 1.0f;     // 1 matches the headset's pixel density across the stage
+        internal float Sharpness = 1.0f;     // resolution scale: 1 matches the headset's pixel density across the stage
+        internal float PopOut;               // 0 keeps the gameplay plane on the stage. Above 0, a deeper layer sits there.
+        internal float Sharpen = 0.3f;       // strength of the sharpen pass, 0 is off
+        internal bool StereoFixes = true;    // lab switch: the second-eye fixes below
         internal bool MatchRefresh = true;   // run one game tick per headset frame
 
         // Where the viewer was when the stage was placed, and which way they faced. Eye poses are read relative to this.
@@ -84,6 +91,8 @@ namespace OriVR
         RenderTexture[] eyeRender = new RenderTexture[2];
         RenderTexture[] eyeOut = new RenderTexture[2];
         UberAlphaBuffer[] eyeAlpha = new UberAlphaBuffer[2];
+        // During a cross fade the game alternates two views, so each eye keeps one buffer per view.
+        UberAlphaBuffer[,] fadeAlpha = new UberAlphaBuffer[2, 2];
         Material copyMat;
         Texture2D stampTex;
         Camera cam;
@@ -108,6 +117,8 @@ namespace OriVR
             OriXR_State = Fn<StateFn>(module, "OriXR_State");
             OriXR_SetStage = Fn<SetStageFn>(module, "OriXR_SetStage");
             OriXR_SetSize = Fn<SetSizeFn>(module, "OriXR_SetSize");
+            OriXR_SetSharpen = Fn<SetSharpenFn>(module, "OriXR_SetSharpen");
+            OriXR_DumpNext = Fn<DumpNextFn>(module, "OriXR_DumpNext");
             OriXR_RecommendedWidth = Fn<RecommendedWidthFn>(module, "OriXR_RecommendedWidth");
             OriXR_Start = Fn<StartFn>(module, "OriXR_Start");
             OriXR_BeginFrame = Fn<BeginFrameFn>(module, "OriXR_BeginFrame");
@@ -137,6 +148,8 @@ namespace OriVR
                 eyeOut[i].name = "OriVR eye out " + i;
                 eyeOut[i].Create();
                 eyeAlpha[i] = new UberAlphaBuffer();
+                fadeAlpha[i, 0] = new UberAlphaBuffer();
+                fadeAlpha[i, 1] = new UberAlphaBuffer();
             }
             stampTex = new Texture2D(32, 1, TextureFormat.RGB24, false);
             stampTex.filterMode = FilterMode.Point;
@@ -174,6 +187,19 @@ namespace OriVR
         internal void Shot() { wantShot = true; }
 
         internal void Recenter() { wantRecenter = true; }
+
+        internal void Dump(string basePath) { if (nativeLoaded) OriXR_DumpNext(basePath); }
+
+        // Lab: renders the next frame with both eyes in the same place. The two images must then match exactly,
+        // so any difference is an effect that behaves differently for the second eye.
+        // They are held together for a few frames first, because each eye's alpha buffer comes from its previous frame.
+        internal void EyeCheck() { eyeCheckFrames = 4; }
+        int eyeCheckFrames;
+
+        static readonly System.Reflection.FieldInfo DistortField = HarmonyLib.AccessTools.Field(typeof(UberPostProcess), "m_renderDistort");
+        static readonly System.Reflection.FieldInfo ZonesField = HarmonyLib.AccessTools.Field(typeof(UberPostProcess), "m_renderZones");
+        static readonly System.Reflection.FieldInfo LastPosField = HarmonyLib.AccessTools.Field(typeof(UberPostProcess), "m_lastPos");
+        internal static int EyeIndex;
 
         internal int WantedWidth()
         {
@@ -255,6 +281,7 @@ namespace OriVR
         internal void ApplyStage()
         {
             if (!nativeLoaded) return;
+            OriXR_SetSharpen(Sharpen);
             var c = viewPoint + viewTurn * new Vector3(0f, 0f, -StageDistance);
             OriXR_SetStage(c.x, c.y, c.z, StageWidth, StageWidth * EyeHeight / EyeWidth, viewTurn.y, viewTurn.w);
         }
@@ -354,12 +381,29 @@ namespace OriVR
             var view = cam.worldToCameraMatrix;
             float dist = -cam.transform.position.z;
             float unitsPerMetre = cur.CameraWidthWorldUnits / StageWidth;
+            float planeZ = PopOut * dist;
+            bool checking = eyeCheckFrames > 0;
+            bool compareNow = eyeCheckFrames == 1;
+            if (eyeCheckFrames > 0) eyeCheckFrames--;
+
+            // The game queues these once per frame and clears them in the first render, so the second eye gets a copy.
+            var distort = StereoFixes ? new System.Collections.Generic.List<MeshFilter>((System.Collections.Generic.List<MeshFilter>)DistortField.GetValue(post)) : null;
+            var zones = StereoFixes ? new System.Collections.Generic.List<UberMotionBlurInterestZone>((System.Collections.Generic.List<UberMotionBlurInterestZone>)ZonesField.GetValue(post)) : null;
+            // Camera velocity is worked out from the last render's position, so the second eye starts from the same place.
+            object lastPos = LastPosField.GetValue(post);
 
             for (int i = 0; i < 2; i++)
             {
+                EyeIndex = i;
+                if (i == 1 && StereoFixes)
+                {
+                    DistortField.SetValue(post, distort);
+                    ZonesField.SetValue(post, zones);
+                    LastPosField.SetValue(post, lastPos);
+                }
                 var e = i == 0 ? info.eye0 : info.eye1;
                 // Without valid tracking, stand at the stage's normal viewing spot with a fixed eye gap.
-                var local = info.viewsValid != 0
+                var local = checking ? Vector3.zero : info.viewsValid != 0
                     ? Quaternion.Inverse(viewTurn) * (new Vector3(e.px, e.py, e.pz) - viewPoint)
                     : new Vector3(i == 0 ? -0.0315f : 0.0315f, 0f, 0f);
                 float x = local.x * unitsPerMetre * Separation;
@@ -367,12 +411,10 @@ namespace OriVR
                 float eyeDist = Mathf.Max(dist + local.z * unitsPerMetre, dist * 0.25f);
 
                 cam.worldToCameraMatrix = Matrix4x4.TRS(new Vector3(-x, -y, -(eyeDist - dist)), Quaternion.identity, Vector3.one) * view;
-                cam.projectionMatrix = RenderTests.EyeProjection(cam, x, y, eyeDist);
-                if (!crossFading)
-                {
-                    post.CurrentAlphaBuffer = eyeAlpha[i];
-                    eyeAlpha[i].SetCurrentAlphaGrab();
-                }
+                cam.projectionMatrix = RenderTests.EyeProjection(cam, x, y, eyeDist, planeZ);
+                var alpha = crossFading ? fadeAlpha[i, CrossFadePatch.CurrentView(Game.UI.Cameras.System.UberPostProcessingCrossFade)] : eyeAlpha[i];
+                post.CurrentAlphaBuffer = alpha;
+                alpha.SetCurrentAlphaGrab();
                 // Plant sway moves on after the last eye only, so both eyes draw the same sway.
                 RenderTests.SkipTurbulenceNow = i == 0;
                 cam.targetTexture = eyeRender[i];
@@ -385,7 +427,7 @@ namespace OriVR
             cam.ResetProjectionMatrix();
             cam.cullingMask = 0;
             InEyeRender = false;
-            if (!crossFading) post.CurrentAlphaBuffer = savedAlpha;
+            post.CurrentAlphaBuffer = savedAlpha;
             renderedPairs++;
 
             if (Mirror) Graphics.Blit(eyeRender[0], (RenderTexture)null);
@@ -394,6 +436,7 @@ namespace OriVR
                 wantShot = false;
                 SaveEyes();
             }
+            if (compareNow) CompareEyes();
         }
 
         // Copies the eye image to the texture the native side sends on, upside down if asked, with the frame number.
@@ -430,6 +473,35 @@ namespace OriVR
             }
             GL.PopMatrix();
             RenderTexture.active = old;
+        }
+
+        void CompareEyes()
+        {
+            var old = RenderTexture.active;
+            var pixels = new Color32[2][];
+            for (int i = 0; i < 2; i++)
+            {
+                RenderTexture.active = eyeOut[i];
+                var tex = new Texture2D(eyeOut[i].width, eyeOut[i].height, TextureFormat.RGB24, false);
+                tex.ReadPixels(new Rect(0, 0, tex.width, tex.height), 0, 0);
+                tex.Apply();
+                pixels[i] = tex.GetPixels32();
+                Directory.CreateDirectory(ShotDir);
+                File.WriteAllBytes(Path.Combine(ShotDir, "check_" + i + ".png"), tex.EncodeToPNG());
+                Destroy(tex);
+            }
+            RenderTexture.active = old;
+            int differing = 0, max = 0;
+            for (int i = 0; i < pixels[0].Length; i++)
+            {
+                var a = pixels[0][i];
+                var b = pixels[1][i];
+                int d = Mathf.Max(Mathf.Abs(a.r - b.r), Mathf.Max(Mathf.Abs(a.g - b.g), Mathf.Abs(a.b - b.b)));
+                if (d > 0) differing++;
+                if (d > max) max = d;
+            }
+            Plugin.Log.LogInfo(string.Format("EYECHECK frame {0}, fixes {1}, cross fading {2}: differing pixels {3} of {4}, max {5}", Time.frameCount, StereoFixes,
+                Game.UI.Cameras.System != null && Game.UI.Cameras.System.CrossFadeManager.IsCrossFading, differing, pixels[0].Length, max));
         }
 
         void SaveEyes()

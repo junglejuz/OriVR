@@ -13,7 +13,7 @@ namespace OriVR
         static readonly Color Gold = new Color(1f, 0.82f, 0.45f, 1f);
         static readonly Color Dim = new Color(0.75f, 0.78f, 0.8f, 1f);
         static readonly Color Title = new Color(0.72f, 0.9f, 1f, 1f);
-        const int Rows = 7;  // distance, size, depth, sharpness, recenter, defaults, close
+        const int Rows = 9;  // distance, size, depth, pop-out, sharpen, resolution, recenter, defaults, close
 
         internal XrRig Rig;
         internal Action<int, int> Adjust;  // row, direction
@@ -93,7 +93,7 @@ namespace OriVR
             Show(titleBox, "VR SETTINGS");
             for (int i = 0; i < Rows; i++)
             {
-                rows[i] = MakeText(root.transform, style, RowY(i), 0.72f);
+                rows[i] = MakeText(root.transform, style, RowY(i), 0.66f);
             }
             hintBox = MakeText(root.transform, style, -2.72f, 0.5f);
             hintBox.color = Dim;
@@ -146,7 +146,7 @@ namespace OriVR
             }
             if (shader == null) { Plugin.Log.LogWarning("menu: no panel shader, text only"); return; }
             MakeQuad(parent, shader, "panel", 5.6f, 3.7f, 0.5f, SoftBox(128, 128, new Color(0.015f, 0.04f, 0.075f), 0.97f, 0.12f, 0.12f));
-            bar = MakeQuad(parent, shader, "bar", 4.2f, 0.3f, 0.25f, SoftBox(128, 16, new Color(0.2f, 0.5f, 0.85f), 0.55f, 0.5f, 0.5f));
+            bar = MakeQuad(parent, shader, "bar", 4.2f, 0.27f, 0.25f, SoftBox(128, 16, new Color(0.2f, 0.5f, 0.85f), 0.55f, 0.5f, 0.5f));
             line = MakeQuad(parent, shader, "line", 3.2f, 0.018f, 0.25f, SoftBox(128, 4, new Color(0.45f, 0.75f, 1f), 0.8f, 0.5f, 0f));
             line.localPosition = new Vector3(0f, 2.25f, 0.25f);
         }
@@ -204,7 +204,7 @@ namespace OriVR
             lastSelected = selected;
         }
 
-        static float RowY(int row) { return 1.75f - row * 0.56f; }
+        static float RowY(int row) { return 1.8f - row * 0.48f; }
 
         void Update()
         {

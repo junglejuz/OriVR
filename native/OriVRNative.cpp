@@ -8,7 +8,8 @@
 // to one eye only, placed at a fixed spot in the room: the "stage". Errors are logged, never fatal: a failed OpenXR
 // start leaves the game running flat.
 #include <windows.h>
-#include <d3d11.h>
+#include <d3d11_1.h>
+#include <d3dcompiler.h>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -74,6 +75,17 @@ static int64_t g_format;
 static PFN_xrCreateSwapchain p_createSwap;
 static PFN_xrEnumerateSwapchainImages p_enumImages;
 static PFN_xrDestroySwapchain p_destroySwap;
+static volatile float g_sharpen = 0.0f;
+static char g_dumpPath[MAX_PATH];
+static volatile LONG g_dumpWanted = 0;
+static ID3D11DeviceContext1* g_ctx1;
+static ID3DDeviceContextState* g_passState;
+static ID3D11VertexShader* g_vs;
+static ID3D11PixelShader* g_ps;
+static ID3D11Buffer* g_cb;
+static ID3D11SamplerState* g_sampler;
+static ID3D11Texture2D* g_passTex[2];
+static ID3D11RenderTargetView* g_passRtv[2];
 static std::mutex g_frameLock;
 static std::deque<PendingFrame> g_frames;
 static unsigned long long g_submitted, g_submittedLayers, g_skippedAcquire;
@@ -110,6 +122,170 @@ static void HereDir(char* path, DWORD size) {
     if (slash) slash[1] = 0;
 }
 
+// Contrast adaptive sharpening, after the idea of AMD FidelityFX CAS (MIT licence): each pixel is pushed away from its
+// neighbours, less where local contrast is already high, so edges do not ring.
+static const char* g_shader = R"(
+Texture2D src : register(t0);
+SamplerState pointClamp : register(s0);
+cbuffer Params : register(b0) { float amount; float texelX; float texelY; float pad; };
+void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD0) {
+    uv = float2((id << 1) & 2, id & 2);
+    pos = float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1);
+}
+float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float3 c = src.Sample(pointClamp, uv).rgb;
+    float3 n = src.Sample(pointClamp, uv + float2(0, -texelY)).rgb;
+    float3 s = src.Sample(pointClamp, uv + float2(0, texelY)).rgb;
+    float3 e = src.Sample(pointClamp, uv + float2(texelX, 0)).rgb;
+    float3 w = src.Sample(pointClamp, uv + float2(-texelX, 0)).rgb;
+    float3 lo = min(c, min(n, min(s, min(e, w))));
+    float3 hi = max(c, max(n, max(s, max(e, w))));
+    float3 room = saturate(min(lo, 1 - hi) / max(hi, 0.0001));
+    float3 weight = sqrt(room) * (-1.0 / lerp(8.0, 5.0, amount));
+    float3 result = (c + (n + s + e + w) * weight) / (1 + 4 * weight);
+    return float4(saturate(result), 1);
+}
+)";
+
+static bool CreateSharpenPass() {
+    HMODULE compilerDll = LoadLibraryA("d3dcompiler_47.dll");
+    if (!compilerDll) { Log("sharpen off: no d3dcompiler_47.dll"); return false; }
+    auto compile = (pD3DCompile)GetProcAddress(compilerDll, "D3DCompile");
+    if (!compile) return false;
+    ID3DBlob* vsBlob = nullptr; ID3DBlob* psBlob = nullptr; ID3DBlob* err = nullptr;
+    size_t len = strlen(g_shader);
+    if (FAILED(compile(g_shader, len, "sharpen", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsBlob, &err)) ||
+        FAILED(compile(g_shader, len, "sharpen", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &psBlob, &err))) {
+        Log("sharpen off: shader error %s", err ? (const char*)err->GetBufferPointer() : "unknown");
+        return false;
+    }
+    g_dev->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_vs);
+    g_dev->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_ps);
+    D3D11_BUFFER_DESC cb{};
+    cb.ByteWidth = 16;
+    cb.Usage = D3D11_USAGE_DEFAULT;
+    cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    g_dev->CreateBuffer(&cb, nullptr, &g_cb);
+    D3D11_SAMPLER_DESC sd{};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    g_dev->CreateSamplerState(&sd, &g_sampler);
+    // Our own pipeline state object: Unity's state is swapped out for the pass and put back untouched.
+    ID3D11Device1* dev1 = nullptr;
+    if (FAILED(g_dev->QueryInterface(__uuidof(ID3D11Device1), (void**)&dev1))) { Log("sharpen off: no D3D 11.1"); return false; }
+    g_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&g_ctx1);
+    D3D_FEATURE_LEVEL level = g_dev->GetFeatureLevel();
+    UINT stateFlags = (g_dev->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED) ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED : 0;
+    HRESULT hr = dev1->CreateDeviceContextState(stateFlags, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device), nullptr, &g_passState);
+    dev1->Release();
+    if (FAILED(hr) || !g_ctx1) { Log("sharpen off: no context state, %08lx", (unsigned long)hr); return false; }
+    Log("sharpen pass ready");
+    return g_vs && g_ps && g_cb && g_sampler;
+}
+
+static void CreatePassTargets() {
+    for (int e = 0; e < 2; e++) {
+        if (g_passRtv[e]) { g_passRtv[e]->Release(); g_passRtv[e] = nullptr; }
+        if (g_passTex[e]) { g_passTex[e]->Release(); g_passTex[e] = nullptr; }
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = g_w;
+        td.Height = g_h;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &g_passTex[e]))) continue;
+        D3D11_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        g_dev->CreateRenderTargetView(g_passTex[e], &rv, &g_passRtv[e]);
+    }
+}
+
+// Returns the sharpened texture, or the source when sharpening is off or cannot run.
+static ID3D11Texture2D* Sharpen(int e, ID3D11Texture2D* src) {
+    float amount = g_sharpen;
+    if (amount <= 0.0f || !g_passState || !g_passRtv[e]) return src;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView* srv = nullptr;
+    if (FAILED(g_dev->CreateShaderResourceView(src, &sv, &srv))) return src;
+    ID3DDeviceContextState* unityState = nullptr;
+    g_ctx1->SwapDeviceContextState(g_passState, &unityState);
+    float params[4] = {amount, 1.0f / g_w, 1.0f / g_h, 0};
+    g_ctx->UpdateSubresource(g_cb, 0, nullptr, params, 0, 0);
+    D3D11_VIEWPORT vp{0, 0, (float)g_w, (float)g_h, 0, 1};
+    g_ctx->RSSetViewports(1, &vp);
+    g_ctx->OMSetRenderTargets(1, &g_passRtv[e], nullptr);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->VSSetShader(g_vs, nullptr, 0);
+    g_ctx->PSSetShader(g_ps, nullptr, 0);
+    g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+    g_ctx->PSSetSamplers(0, 1, &g_sampler);
+    g_ctx->PSSetShaderResources(0, 1, &srv);
+    g_ctx->Draw(3, 0);
+    ID3D11ShaderResourceView* noSrv = nullptr;
+    ID3D11RenderTargetView* noRtv = nullptr;
+    g_ctx->PSSetShaderResources(0, 1, &noSrv);
+    g_ctx->OMSetRenderTargets(1, &noRtv, nullptr);
+    g_ctx1->SwapDeviceContextState(unityState, nullptr);
+    if (unityState) unityState->Release();
+    srv->Release();
+    return g_passTex[e];
+}
+
+// Lab: writes the exact pixels going to the headset as a BMP, so the sharpen pass can be measured.
+static void DumpImage(int e, ID3D11Texture2D* tex) {
+    D3D11_TEXTURE2D_DESC td;
+    tex->GetDesc(&td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    ID3D11Texture2D* staging = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &staging))) return;
+    g_ctx->CopyResource(staging, tex);
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (SUCCEEDED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
+        char path[MAX_PATH + 16];
+        sprintf_s(path, "%s_%d.bmp", g_dumpPath, e);
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "wb") == 0 && f) {
+            BITMAPFILEHEADER fh{};
+            BITMAPINFOHEADER ih{};
+            fh.bfType = 0x4D42;
+            fh.bfOffBits = sizeof(fh) + sizeof(ih);
+            fh.bfSize = fh.bfOffBits + td.Width * td.Height * 3;
+            ih.biSize = sizeof(ih);
+            ih.biWidth = td.Width;
+            ih.biHeight = -(LONG)td.Height;  // first row is the top of the image
+            ih.biPlanes = 1;
+            ih.biBitCount = 24;
+            fwrite(&fh, sizeof(fh), 1, f);
+            fwrite(&ih, sizeof(ih), 1, f);
+            int pad = (4 - (td.Width * 3) % 4) % 4;
+            std::vector<unsigned char> row(td.Width * 3 + pad);
+            for (UINT y = 0; y < td.Height; y++) {
+                const unsigned char* in = (const unsigned char*)map.pData + y * map.RowPitch;
+                for (UINT x = 0; x < td.Width; x++) {
+                    row[x * 3] = in[x * 4 + 2];
+                    row[x * 3 + 1] = in[x * 4 + 1];
+                    row[x * 3 + 2] = in[x * 4];
+                }
+                fwrite(row.data(), 1, row.size(), f);
+            }
+            fclose(f);
+            Log("DUMP eye %d written, %ux%u, sharpen %.2f", e, td.Width, td.Height, (float)g_sharpen);
+        }
+        g_ctx->Unmap(staging, 0);
+    }
+    staging->Release();
+}
+
 static bool CreateSwapchains() {
     for (int e = 0; e < 2; e++) {
         XrSwapchainCreateInfo c{XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -126,6 +302,7 @@ static bool CreateSwapchains() {
         XRCHECK(p_enumImages(g_swap[e].handle, ic, &ic, (XrSwapchainImageBaseHeader*)g_swap[e].images.data()));
     }
     Log("swapchains %dx%d, %zu images per eye", g_w, g_h, g_swap[0].images.size());
+    CreatePassTargets();
     return true;
 }
 
@@ -235,6 +412,7 @@ static bool StartXr() {
             Log("headset recommends %dx%d per eye", g_recW, g_recH);
         }
     }
+    CreateSharpenPass();
     if (!CreateSwapchains()) return false;
 
     return GetFn("xrPollEvent", p_poll) && GetFn("xrBeginSession", p_beginSession) && GetFn("xrEndSession", p_endSession) &&
@@ -268,7 +446,12 @@ static bool CopyEye(int e, ID3D11Texture2D* src, XrCompositionLayerQuad& quad) {
     wi.timeout = 100000000;  // 100 ms
     r = p_waitImage(g_swap[e].handle, &wi);
     if (r != XR_SUCCESS) { Log("wait image: %d", (int)r); if (XR_FAILED(r)) return false; }
-    g_ctx->CopySubresourceRegion(g_swap[e].images[idx].texture, 0, 0, 0, 0, src, 0, nullptr);
+    ID3D11Texture2D* finalImage = Sharpen(e, src);
+    g_ctx->CopySubresourceRegion(g_swap[e].images[idx].texture, 0, 0, 0, 0, finalImage, 0, nullptr);
+    if (g_dumpWanted) {
+        DumpImage(e, finalImage);
+        if (e == 1) g_dumpWanted = 0;
+    }
     p_release(g_swap[e].handle, nullptr);
 
     quad = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
@@ -350,6 +533,8 @@ API void OriXR_SetStage(float cx, float cy, float cz, float width, float height,
 
 // Takes effect with the next resize event on the render thread.
 API void OriXR_SetSize(int width, int height) { g_newW = width; g_newH = height; }
+API void OriXR_SetSharpen(float amount) { g_sharpen = amount; }
+API void OriXR_DumpNext(const char* basePath) { strcpy_s(g_dumpPath, basePath); g_dumpWanted = 1; }
 API int OriXR_RecommendedWidth() { return g_recW; }
 
 // Call on the main thread before the init event. The textures must already exist in the Unity player.

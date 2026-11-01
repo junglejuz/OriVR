@@ -1,0 +1,15 @@
+OriVR includes these unmodified parts. Their licences are in the licences folder.
+
+BepInEx 5.4.23.6
+  https://github.com/BepInEx/BepInEx
+  LGPL-2.1. Includes UnityDoorstop, HarmonyX, MonoMod and Mono.Cecil under their own licences.
+  Source code is available at the link above.
+
+OpenXR loader 1.1.65 (Khronos Group)
+  https://github.com/KhronosGroup/OpenXR-SDK-Source
+  Apache-2.0.
+
+The sharpening pass in OriVR follows the idea of AMD FidelityFX Contrast Adaptive Sharpening (MIT licence).
+It is OriVR's own code, not a copy of AMD's.
+
+Ori and the Blind Forest belongs to Moon Studios and Xbox Game Studios. This mod contains no game files.

@@ -154,17 +154,20 @@ namespace OriVR
         // Off-axis projection through the rectangle the flat game shows at z 0, seen from an eye moved sideways.
         internal static Matrix4x4 EyeProjection(Camera cam, float eyeX)
         {
-            return EyeProjection(cam, eyeX, 0f, -cam.transform.position.z);
+            return EyeProjection(cam, eyeX, 0f, -cam.transform.position.z, 0f);
         }
 
-        // eyeX, eyeY: the eye's offset from the flat camera. eyeDist: its distance from the plane. All in game units.
-        internal static Matrix4x4 EyeProjection(Camera cam, float eyeX, float eyeY, float eyeDist)
+        // eyeX, eyeY: the eye's offset from the flat camera. eyeDist: its distance from the plane z 0. planeZ: the world
+        // depth that sits exactly on the stage (the rest is in front or behind). All in game units. The picture seen from
+        // the middle does not depend on planeZ, because the rectangle grows with the distance.
+        internal static Matrix4x4 EyeProjection(Camera cam, float eyeX, float eyeY, float eyeDist, float planeZ)
         {
             float dist = -cam.transform.position.z; // the gameplay plane is z 0
             float n = cam.nearClipPlane;
-            float halfH = dist * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
+            float grow = (dist + planeZ) / dist;
+            float halfH = dist * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad) * grow;
             float halfW = halfH * cam.aspect;
-            float scale = n / eyeDist;
+            float scale = n / (eyeDist + planeZ);
             float l = (-halfW - eyeX) * scale, r = (halfW - eyeX) * scale;
             float b = (-halfH - eyeY) * scale, t = (halfH - eyeY) * scale;
             var flat = cam.projectionMatrix;
