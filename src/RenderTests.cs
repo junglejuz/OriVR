@@ -10,12 +10,23 @@ namespace OriVR
     {
         internal static bool FreezeTurbulenceSetting = true;
         internal static bool SkipTurbulenceNow;
+        static bool HoldSway;
         internal string ShotDir;
         internal bool Busy;
 
         internal void Compare()
         {
             if (!Busy) StartCoroutine(CompareRoutine());
+        }
+
+        // Holds the sway for one whole frame, so the game's own render and our renders all use one sway. If the first
+        // extra render now matches the second, the leftover difference came from the alpha buffer the game's render left.
+        internal void CompareSameSway()
+        {
+            if (Busy) return;
+            SkipTurbulenceNow = true;
+            HoldSway = true;
+            StartCoroutine(CompareRoutine());
         }
 
         internal void Stereo(float separation)
@@ -37,7 +48,7 @@ namespace OriVR
             cam.targetTexture = rt;
             SkipTurbulenceNow = FreezeTurbulenceSetting;
             cam.Render();
-            SkipTurbulenceNow = false;
+            SkipTurbulenceNow = HoldSway;
             cam.targetTexture = null;
             RenderTexture.active = rt;
             var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false);
@@ -103,19 +114,27 @@ namespace OriVR
                 rt.Release();
                 Destroy(rt);
             }
+            HoldSway = false;
+            SkipTurbulenceNow = false;
             Busy = false;
         }
 
         // Off-axis projection through the rectangle the flat game shows at z 0, seen from an eye moved sideways.
         internal static Matrix4x4 EyeProjection(Camera cam, float eyeX)
         {
+            return EyeProjection(cam, eyeX, 0f, -cam.transform.position.z);
+        }
+
+        // eyeX, eyeY: the eye's offset from the flat camera. eyeDist: its distance from the plane. All in game units.
+        internal static Matrix4x4 EyeProjection(Camera cam, float eyeX, float eyeY, float eyeDist)
+        {
             float dist = -cam.transform.position.z; // the gameplay plane is z 0
             float n = cam.nearClipPlane;
             float halfH = dist * Mathf.Tan(cam.fieldOfView * 0.5f * Mathf.Deg2Rad);
             float halfW = halfH * cam.aspect;
-            float scale = n / dist;
+            float scale = n / eyeDist;
             float l = (-halfW - eyeX) * scale, r = (halfW - eyeX) * scale;
-            float b = -halfH * scale, t = halfH * scale;
+            float b = (-halfH - eyeY) * scale, t = (halfH - eyeY) * scale;
             var flat = cam.projectionMatrix;
             var m = Matrix4x4.zero;
             m[0, 0] = 2f * n / (r - l);

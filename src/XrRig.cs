@@ -1,0 +1,350 @@
+using System;
+using System.Collections;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using UnityEngine;
+
+namespace OriVR
+{
+    // Renders the game camera once per eye from one game tick and hands both images to OriVRNative.
+    //
+    // The diorama: a flat rectangle fixed in the room (the stage) shows what the flat game shows at z 0. Each eye looks
+    // through that rectangle from its own place, so z 0 stays at the stage, background sits behind and foreground in front.
+    internal class XrRig : MonoBehaviour
+    {
+        const string Dll = "OriVRNative";
+        const int EventInit = 1, EventSubmit = 2, EventShutdown = 3;
+
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        struct EyeView { public float px, py, pz, qx, qy, qz, qw, left, right, up, down; }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 4)]
+        struct FrameInfo
+        {
+            public int running, shouldRender, viewsValid, sessionState;
+            public float periodMs;
+            public EyeView eye0, eye1;
+        }
+
+        [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)] static extern IntPtr LoadLibraryA(string path);
+        [DllImport("kernel32", CharSet = CharSet.Ansi, ExactSpelling = true)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+        // Unity's Mono will not bind a DllImport to a DLL in the plugin folder, so the functions are fetched by hand.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr GetRenderEventFn();
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int StateFn();
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SetStageFn(float cx, float cy, float cz, float width, float height);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void StartFn(IntPtr left, IntPtr right, int width, int height);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int BeginFrameFn(out FrameInfo info, IntPtr left, IntPtr right);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int PopLogFn(StringBuilder buffer, int size);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void StatsFn(out uint frames, out uint layers, out uint skipped);
+
+        GetRenderEventFn OriXR_GetRenderEvent;
+        StateFn OriXR_State;
+        SetStageFn OriXR_SetStage;
+        StartFn OriXR_Start;
+        BeginFrameFn OriXR_BeginFrame;
+        PopLogFn OriXR_PopLog;
+        StatsFn OriXR_Stats;
+
+        static T Fn<T>(IntPtr module, string name) where T : class
+        {
+            var p = GetProcAddress(module, name);
+            if (p == IntPtr.Zero) throw new EntryPointNotFoundException(name);
+            return Marshal.GetDelegateForFunctionPointer(p, typeof(T)) as T;
+        }
+
+        internal string PluginDir;
+        internal string ShotDir;
+        internal float StageWidth = 2.0f, StageDistance = 2.0f, Separation = 1.0f;
+        internal int EyeWidth = 2560, EyeHeight = 1440;
+        internal bool FlipY = true, Stamp, Mirror = true;
+        internal bool ForceRender;  // lab test: keep rendering eyes when the runtime is not asking for images
+
+        // While these hold, the game camera's own flat render draws nothing and skips post-processing. The camera stays
+        // enabled because SoundController2D and GUIController read Camera.main, which is null for a disabled camera.
+        internal static bool SuppressFlat, InEyeRender;
+
+        bool nativeLoaded, active, wantShot, loggedPose;
+        int savedMask = -1;
+        IntPtr renderEvent;
+        RenderTexture[] eyeRender = new RenderTexture[2];
+        RenderTexture[] eyeOut = new RenderTexture[2];
+        UberAlphaBuffer[] eyeAlpha = new UberAlphaBuffer[2];
+        Material copyMat;
+        Texture2D stampTex;
+        Camera cam;
+        int savedTargetFps, savedVsync;
+        readonly StringBuilder logBuf = new StringBuilder(512);
+        uint renderedPairs;
+        int lastState = -1;
+
+        internal bool Active { get { return active; } }
+
+        bool LoadNative()
+        {
+            if (nativeLoaded) return true;
+            var path = Path.Combine(PluginDir, Dll + ".dll");
+            var module = LoadLibraryA(path);
+            if (module == IntPtr.Zero)
+            {
+                Plugin.Log.LogError("could not load " + path + ", error " + Marshal.GetLastWin32Error());
+                return false;
+            }
+            OriXR_GetRenderEvent = Fn<GetRenderEventFn>(module, "OriXR_GetRenderEvent");
+            OriXR_State = Fn<StateFn>(module, "OriXR_State");
+            OriXR_SetStage = Fn<SetStageFn>(module, "OriXR_SetStage");
+            OriXR_Start = Fn<StartFn>(module, "OriXR_Start");
+            OriXR_BeginFrame = Fn<BeginFrameFn>(module, "OriXR_BeginFrame");
+            OriXR_PopLog = Fn<PopLogFn>(module, "OriXR_PopLog");
+            OriXR_Stats = Fn<StatsFn>(module, "OriXR_Stats");
+            renderEvent = OriXR_GetRenderEvent();
+            nativeLoaded = true;
+            return true;
+        }
+
+        internal void Begin()
+        {
+            if (active || !LoadNative()) return;
+            var cur = Game.UI.Cameras.Current;
+            if (cur == null) { Plugin.Log.LogWarning("vr on: no gameplay camera yet"); return; }
+            cam = cur.Camera;
+
+            var shader = Shader.Find("Hidden/BlitCopy");
+            if (shader == null) { Plugin.Log.LogError("no Hidden/BlitCopy shader"); return; }
+            copyMat = new Material(shader);
+            for (int i = 0; i < 2; i++)
+            {
+                eyeRender[i] = new RenderTexture(EyeWidth, EyeHeight, 24, RenderTextureFormat.ARGB32);
+                eyeRender[i].name = "OriVR eye render " + i;
+                eyeRender[i].Create();
+                eyeOut[i] = new RenderTexture(EyeWidth, EyeHeight, 0, RenderTextureFormat.ARGB32);
+                eyeOut[i].name = "OriVR eye out " + i;
+                eyeOut[i].Create();
+                eyeAlpha[i] = new UberAlphaBuffer();
+            }
+            stampTex = new Texture2D(32, 1, TextureFormat.RGB24, false);
+            stampTex.filterMode = FilterMode.Point;
+
+            savedTargetFps = Application.targetFrameRate;
+            savedVsync = QualitySettings.vSyncCount;
+            Application.targetFrameRate = -1;
+            QualitySettings.vSyncCount = 0;  // xrWaitFrame paces the game now
+
+            ApplyStage();
+            OriXR_Start(eyeOut[0].GetNativeTexturePtr(), eyeOut[1].GetNativeTexturePtr(), EyeWidth, EyeHeight);
+            GL.IssuePluginEvent(renderEvent, EventInit);
+            active = true;
+            Plugin.Log.LogInfo(string.Format("VR starting: eye {0}x{1}, stage {2} m wide at {3} m, separation x{4}", EyeWidth, EyeHeight, StageWidth, StageDistance, Separation));
+            StartCoroutine(Loop());
+        }
+
+        internal void End()
+        {
+            if (!active) return;
+            active = false;
+            ShowFlat();
+            Application.targetFrameRate = savedTargetFps;
+            QualitySettings.vSyncCount = savedVsync;
+            GL.IssuePluginEvent(renderEvent, EventShutdown);
+            Plugin.Log.LogInfo("VR stopped after " + renderedPairs + " eye pairs");
+        }
+
+        internal void Shot() { wantShot = true; }
+
+        void ShowFlat()
+        {
+            SuppressFlat = false;
+            if (cam != null && savedMask != -1) cam.cullingMask = savedMask;
+            savedMask = -1;
+        }
+
+        internal void ApplyStage()
+        {
+            if (nativeLoaded) OriXR_SetStage(0f, 0f, -StageDistance, StageWidth, StageWidth * EyeHeight / EyeWidth);
+        }
+
+        void Update()
+        {
+            if (!nativeLoaded) return;
+            while (OriXR_PopLog(logBuf, logBuf.Capacity) != 0)
+            {
+                Plugin.Log.LogInfo("XR: " + logBuf);
+                logBuf.Length = 0;
+            }
+            logBuf.Length = 0;
+        }
+
+        IEnumerator Loop()
+        {
+            var wait = new WaitForEndOfFrame();
+            float nextStat = Time.realtimeSinceStartup + 5f;
+            int ticksAtStat = Plugin.Ticks, framesAtStat = Time.frameCount;
+            while (active)
+            {
+                yield return wait;
+                if (!active) break;
+                var cur = Game.UI.Cameras.Current;
+                if (cur == null) continue;
+                if (cam != cur.Camera)
+                {
+                    ShowFlat();
+                    cam = cur.Camera;
+                }
+
+                int state = OriXR_State();
+                if (state != lastState)
+                {
+                    lastState = state;
+                    Plugin.Log.LogInfo("XR native state " + state);
+                }
+                if (state == 3) { End(); yield break; }
+                if (state != 2) continue;
+
+                for (int i = 0; i < 2; i++)
+                {
+                    if (!eyeRender[i].IsCreated()) eyeRender[i].Create();
+                    if (!eyeOut[i].IsCreated()) eyeOut[i].Create();
+                }
+                FrameInfo info;
+                bool frame = OriXR_BeginFrame(out info, eyeOut[0].GetNativeTexturePtr(), eyeOut[1].GetNativeTexturePtr()) != 0;
+                if (!frame)
+                {
+                    // Session idle: leave the flat game running.
+                    ShowFlat();
+                    continue;
+                }
+                if (info.shouldRender != 0 || ForceRender) RenderEyes(cur, info);
+                else ShowFlat();
+                GL.IssuePluginEvent(renderEvent, EventSubmit);
+
+                float now = Time.realtimeSinceStartup;
+                if (now >= nextStat)
+                {
+                    uint frames, layers, skipped;
+                    OriXR_Stats(out frames, out layers, out skipped);
+                    float span = now - (nextStat - 5f);
+                    Plugin.Log.LogInfo(string.Format("XRSTAT state {0} shouldRender {1} period {2:F2} ms, unity {3:F1} fps, ticks {4:F1}/s, submitted {5}, with images {6}, skipped {7}, pairs {8}",
+                        info.sessionState, info.shouldRender, info.periodMs, (Time.frameCount - framesAtStat) / span, (Plugin.Ticks - ticksAtStat) / span, frames, layers, skipped, renderedPairs));
+                    nextStat = now + 5f;
+                    ticksAtStat = Plugin.Ticks;
+                    framesAtStat = Time.frameCount;
+                }
+            }
+        }
+
+        void RenderEyes(GameplayCamera cur, FrameInfo info)
+        {
+            if (info.viewsValid != 0 && !loggedPose)
+            {
+                loggedPose = true;
+                Plugin.Log.LogInfo(string.Format("XRVIEW left pos ({0:F3},{1:F3},{2:F3}) fov L {3:F3} R {4:F3} U {5:F3} D {6:F3}; right pos ({7:F3},{8:F3},{9:F3}) fov L {10:F3} R {11:F3} U {12:F3} D {13:F3}",
+                    info.eye0.px, info.eye0.py, info.eye0.pz, info.eye0.left, info.eye0.right, info.eye0.up, info.eye0.down,
+                    info.eye1.px, info.eye1.py, info.eye1.pz, info.eye1.left, info.eye1.right, info.eye1.up, info.eye1.down));
+            }
+            if (cam.cullingMask != 0) savedMask = cam.cullingMask;
+            SuppressFlat = true;
+            InEyeRender = true;
+            if (savedMask != -1) cam.cullingMask = savedMask;
+            var post = cur.CameraPostProcessing.UberPostProcess;
+            var savedAlpha = post.CurrentAlphaBuffer;
+            bool crossFading = Game.UI.Cameras.System != null && Game.UI.Cameras.System.CrossFadeManager.IsCrossFading;
+            var view = cam.worldToCameraMatrix;
+            float dist = -cam.transform.position.z;
+            float unitsPerMetre = cur.CameraWidthWorldUnits / StageWidth;
+
+            for (int i = 0; i < 2; i++)
+            {
+                var e = i == 0 ? info.eye0 : info.eye1;
+                // Without valid tracking, stand at the stage's normal viewing spot with a fixed eye gap.
+                float ex = info.viewsValid != 0 ? e.px : (i == 0 ? -0.0315f : 0.0315f);
+                float ey = info.viewsValid != 0 ? e.py : 0f;
+                float ez = info.viewsValid != 0 ? e.pz : 0f;
+                float x = ex * unitsPerMetre * Separation;
+                float y = ey * unitsPerMetre * Separation;
+                float eyeDist = Mathf.Max(dist + ez * unitsPerMetre, dist * 0.25f);
+
+                cam.worldToCameraMatrix = Matrix4x4.TRS(new Vector3(-x, -y, -(eyeDist - dist)), Quaternion.identity, Vector3.one) * view;
+                cam.projectionMatrix = RenderTests.EyeProjection(cam, x, y, eyeDist);
+                if (!crossFading)
+                {
+                    post.CurrentAlphaBuffer = eyeAlpha[i];
+                    eyeAlpha[i].SetCurrentAlphaGrab();
+                }
+                // Plant sway moves on after the last eye only, so both eyes draw the same sway.
+                RenderTests.SkipTurbulenceNow = i == 0;
+                cam.targetTexture = eyeRender[i];
+                cam.Render();
+                cam.targetTexture = null;
+                RenderTests.SkipTurbulenceNow = false;
+                Finish(i);
+            }
+            cam.ResetWorldToCameraMatrix();
+            cam.ResetProjectionMatrix();
+            cam.cullingMask = 0;
+            InEyeRender = false;
+            if (!crossFading) post.CurrentAlphaBuffer = savedAlpha;
+            renderedPairs++;
+
+            if (Mirror) Graphics.Blit(eyeRender[0], (RenderTexture)null);
+            if (wantShot)
+            {
+                wantShot = false;
+                SaveEyes();
+            }
+        }
+
+        // Copies the eye image to the texture the native side sends on, upside down if asked, with the frame number.
+        void Finish(int i)
+        {
+            var old = RenderTexture.active;
+            RenderTexture.active = eyeOut[i];
+            copyMat.mainTexture = eyeRender[i];
+            GL.PushMatrix();
+            GL.LoadOrtho();
+            copyMat.SetPass(0);
+            float top = FlipY ? 0f : 1f, bottom = 1f - top;
+            GL.Begin(7);  // GL.QUADS
+            GL.TexCoord2(0f, bottom); GL.Vertex3(0f, 0f, 0f);
+            GL.TexCoord2(0f, top); GL.Vertex3(0f, 1f, 0f);
+            GL.TexCoord2(1f, top); GL.Vertex3(1f, 1f, 0f);
+            GL.TexCoord2(1f, bottom); GL.Vertex3(1f, 0f, 0f);
+            GL.End();
+            if (Stamp)
+            {
+                // 32 blocks, least significant bit first, along the image's lower left edge.
+                int frame = Time.frameCount;
+                for (int b = 0; b < 32; b++) stampTex.SetPixel(b, 0, ((frame >> b) & 1) != 0 ? Color.white : Color.black);
+                stampTex.Apply();
+                copyMat.mainTexture = stampTex;
+                copyMat.SetPass(0);
+                float w = 32f * 12f / eyeOut[i].width, h = 12f / eyeOut[i].height;
+                GL.Begin(7);
+                GL.TexCoord2(0f, 0f); GL.Vertex3(0f, 0f, 0f);
+                GL.TexCoord2(0f, 1f); GL.Vertex3(0f, h, 0f);
+                GL.TexCoord2(1f, 1f); GL.Vertex3(w, h, 0f);
+                GL.TexCoord2(1f, 0f); GL.Vertex3(w, 0f, 0f);
+                GL.End();
+            }
+            GL.PopMatrix();
+            RenderTexture.active = old;
+        }
+
+        void SaveEyes()
+        {
+            Directory.CreateDirectory(ShotDir);
+            var old = RenderTexture.active;
+            for (int i = 0; i < 2; i++)
+            {
+                RenderTexture.active = eyeOut[i];
+                var tex = new Texture2D(eyeOut[i].width, eyeOut[i].height, TextureFormat.RGB24, false);
+                tex.ReadPixels(new Rect(0, 0, tex.width, tex.height), 0, 0);
+                tex.Apply();
+                File.WriteAllBytes(Path.Combine(ShotDir, "xr_eye_" + i + ".png"), tex.EncodeToPNG());
+                Destroy(tex);
+            }
+            RenderTexture.active = old;
+            Plugin.Log.LogInfo("XRSHOT saved at frame " + Time.frameCount);
+        }
+    }
+}
