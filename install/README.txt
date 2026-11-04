@@ -51,5 +51,5 @@ Notes
 - The mod stops the game's telemetry.
 - Settings are saved in BepInEx\config\com.scubasteve2365.orivr.cfg in the game folder.
 
-Version 0.8.0. Credits and licences are in THIRD-PARTY-NOTICES.txt. OriVR is MIT licensed, by scubasteve2365.
+Version 1.0. Credits and licences are in THIRD-PARTY-NOTICES.txt. OriVR is MIT licensed, by scubasteve2365.
 This is a fan mod, not made or approved by Moon Studios or Xbox Game Studios.

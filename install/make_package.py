@@ -44,7 +44,7 @@ shutil.copy2(xr_licence, os.path.join(licences, "OpenXR-loader-LICENSE.txt"))
 shutil.copy2(bep_licence, os.path.join(licences, "BepInEx-LICENSE.txt"))
 shutil.copy2(os.path.join(HERE, "..", "LICENSE"), os.path.join(licences, "OriVR-LICENSE.txt"))
 
-zip_path = os.path.join(BUILD, "package", "OriVR-0.8.0.zip")
+zip_path = os.path.join(BUILD, "package", "OriVR-1.0.zip")
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
     for root, _, names in os.walk(PKG):
         for n in names:
