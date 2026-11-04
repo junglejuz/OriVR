@@ -4,7 +4,8 @@ rem It only touches the game folder. No game files are changed, and uninstall re
 setlocal
 set "ORIVR_HERE=%~dp0"
 set "ORIVR_ARG=%~1"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = Get-Content -LiteralPath '%~f0' -Raw; $s = $t.Substring($t.IndexOf('#PS' + 'START') + 7); Invoke-Expression $s"
+set "ORIVR_SELF=%~f0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = Get-Content -LiteralPath $env:ORIVR_SELF -Raw; $s = $t.Substring($t.IndexOf('#PS' + 'START') + 8); Invoke-Expression $s"
 set "ORIVR_RESULT=%ERRORLEVEL%"
 if "%ORIVR_ARG%"=="" pause
 exit /b %ORIVR_RESULT%
@@ -62,6 +63,10 @@ function Install-Mod($game) {
         if (-not (Test-Path -LiteralPath (Join-Path $game $n))) { Fail "$n did not copy." }
     }
     if ((Get-Content -LiteralPath $cfg -Raw) -notmatch '(?m)^Type = Camera') { Fail 'could not set the start point in BepInEx.cfg.' }
+
+    # Files from a downloaded zip carry a "came from the internet" mark, which can stop the DLLs loading.
+    Get-ChildItem -LiteralPath (Join-Path $game 'BepInEx') -Recurse -File | Unblock-File
+    Unblock-File -LiteralPath (Join-Path $game 'winhttp.dll')
     Write-Host ''
     Write-Host 'OriVR is installed.' -ForegroundColor Green
     Write-Host 'Start SteamVR, then start Ori from Steam. VR starts by itself.'
@@ -75,6 +80,13 @@ function Install-Mod($game) {
         Write-Host 'Until then the game runs flat.'
     } else {
         Write-Host "32-bit OpenXR runtime: $runtime"
+    }
+    $sac = $null
+    try { $sac = (Get-MpComputerStatus -ErrorAction Stop).SmartAppControlState } catch { }
+    if ($sac -and $sac -ne 'Off') {
+        Write-Host ''
+        Write-Host "Warning: Windows Smart App Control is $sac on this PC." -ForegroundColor Yellow
+        Write-Host 'It can block mod DLLs that are not signed, and this mod is not signed. If the game runs flat, check this first. See the README.'
     }
 }
 

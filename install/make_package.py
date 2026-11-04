@@ -34,14 +34,17 @@ with open(os.path.join(config, "BepInEx.cfg"), "w", encoding="ascii", newline="\
     f.write("[Preloader.Entrypoint]\n\nType = Camera\n")
 
 for name in ("Install OriVR.bat", "README.txt", "THIRD-PARTY-NOTICES.txt"):
-    shutil.copy2(os.path.join(HERE, name), PKG)
+    with open(os.path.join(HERE, name), "rb") as src:
+        text = src.read().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")  # Windows line endings, whatever git did
+    with open(os.path.join(PKG, name), "wb") as dst:
+        dst.write(text)
 licences = os.path.join(PKG, "licences")
 os.makedirs(licences)
 shutil.copy2(xr_licence, os.path.join(licences, "OpenXR-loader-LICENSE.txt"))
 shutil.copy2(bep_licence, os.path.join(licences, "BepInEx-LICENSE.txt"))
 shutil.copy2(os.path.join(HERE, "..", "LICENSE"), os.path.join(licences, "OriVR-LICENSE.txt"))
 
-zip_path = os.path.join(BUILD, "package", "OriVR.zip")
+zip_path = os.path.join(BUILD, "package", "OriVR-0.8.0.zip")
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
     for root, _, names in os.walk(PKG):
         for n in names:

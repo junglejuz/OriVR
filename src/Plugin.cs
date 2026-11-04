@@ -7,9 +7,9 @@ using UnityEngine;
 
 namespace OriVR
 {
-    // Build 7: OpenXR diorama with a settings menu. VR starts by itself once the game has a camera, unless VR.AutoStart is false, and if
+    // Build 8 (release 0.8.0): OpenXR diorama with a settings menu. VR starts by itself once the game has a camera, unless VR.AutoStart is false, and if
     // OpenXR cannot start the game stays flat. Telemetry is stopped, because the lab keeps this game offline.
-    [BepInPlugin("com.scubasteve2365.orivr", "OriVR", "0.0.7")]
+    [BepInPlugin("com.scubasteve2365.orivr", "OriVR", "0.8.0")]
     public class Plugin : BaseUnityPlugin
     {
         internal static BepInEx.Logging.ManualLogSource Log;
@@ -23,7 +23,7 @@ namespace OriVR
         internal static int Ticks;
         internal static bool RigActive { get { return instance != null && instance.rig.Active; } }
         static Plugin instance;
-        ConfigEntry<bool> autoStart;
+        ConfigEntry<bool> autoStart, labCommands;
         ConfigEntry<float> stageWidth, stageDistance, separation;
         ConfigEntry<int> eyeWidth;
         bool triedAutoStart;
@@ -48,6 +48,7 @@ namespace OriVR
             rig = gameObject.AddComponent<XrRig>();
             rig.PluginDir = Path.GetDirectoryName(Info.Location);
             rig.ShotDir = tests.ShotDir;
+            labCommands = Config.Bind("Lab", "Commands", false, "Developer test commands read from a file in the game folder. Leave off.");
             autoStart = Config.Bind("VR", "AutoStart", true, "Start VR by itself once the game has a camera.");
             stageWidth = Config.Bind("VR", "StageWidth", DefaultWidth, "Width of the stage in metres.");
             stageDistance = Config.Bind("VR", "StageDistance", DefaultDistance, "Distance to the stage in metres.");
@@ -74,7 +75,7 @@ namespace OriVR
             rig.EyeWidth = eyeWidth.Value;
             rig.EyeHeight = eyeWidth.Value * 9 / 16;
             new Harmony("com.scubasteve2365.orivr").PatchAll(typeof(Plugin).Assembly);
-            Log.LogInfo("OriVR build 7 loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
+            Log.LogInfo("OriVR build 8 loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
         }
 
         void FixedUpdate() { ticks++; Ticks = ticks; }
@@ -162,7 +163,7 @@ namespace OriVR
 
         void ReadCommands()
         {
-            if (!File.Exists(commandFile)) return;
+            if (!labCommands.Value || !File.Exists(commandFile)) return;
             string[] lines;
             try
             {
