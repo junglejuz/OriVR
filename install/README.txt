@@ -43,7 +43,6 @@ Pimax Dream Air through SteamVR, RTX 5090, at 72 Hz. That is the only real heads
 Known limits
 - Steam version only.
 - No DLSS or other upscaler. The game is 32-bit.
-- Cutscene videos have not been fully tested in VR.
 - No motion controls. A gamepad is required.
 - The game itself keeps many CPU threads busy, with or without this mod.
 

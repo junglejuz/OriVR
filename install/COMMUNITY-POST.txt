@@ -19,12 +19,11 @@ What you need
 Please read
 - It has been tested in a real headset on one setup only: Pimax Dream Air, SteamVR, RTX 5090, at 72 Hz. Other headsets and graphics cards should work but have not been tried, and that includes Virtual Desktop's OpenXR runtime. Reports are welcome.
 - There is no DLSS. The game is 32-bit, and DLSS needs a 64-bit game.
-- Cutscene videos have not been fully tested in VR.
 - The mod is not signed, so Windows may warn you, and Smart App Control can block it. The README covers this.
 
 Install
 Unzip it, double click "Install OriVR.bat", and type 1. Start SteamVR, then start Ori from Steam.
 
-Download: [LINK]
+Download: https://github.com/scubasteve2365/OriVR/releases/tag/v0.8.0
 
 By scubasteve2365. MIT licence. Uses BepInEx and the Khronos OpenXR loader. This is a fan mod, not made or approved by Moon Studios or Xbox Game Studios.
