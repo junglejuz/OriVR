@@ -9,15 +9,16 @@ True stereo VR for Ori and the Blind Forest: Definitive Edition. Both eyes are d
 ## What you need
 
 - The Steam version of Ori and the Blind Forest: Definitive Edition
-- A PC VR headset running through SteamVR, version 2.17 or newer
-- SteamVR set as your OpenXR runtime (SteamVR settings, OpenXR), because this game is 32-bit
+- A PC VR headset with a 32-bit OpenXR runtime, because this game is 32-bit. Two have been tested:
+  - SteamVR 2.17 or newer, set as your OpenXR runtime (SteamVR settings, OpenXR)
+  - Virtual Desktop's VDXR, for headsets like the Meta Quest 3
 - A gamepad
 
 ## Install
 
 1. Unzip the release anywhere.
 2. Double click `Install OriVR.bat` and type 1. It finds the game through Steam.
-3. Start SteamVR, then start Ori from Steam. VR starts by itself.
+3. Start SteamVR or connect Virtual Desktop, then start Ori from Steam. VR starts by itself.
 
 To uninstall, run the same bat file and type 2. No game files are changed.
 
@@ -41,7 +42,7 @@ If far backgrounds strain your eyes, lower Depth or raise Pop-out.
 ## Good to know
 
 - The game runs one tick per headset frame, so it follows your headset's refresh rate at normal game speed.
-- Tested in a real headset on one setup: Pimax Dream Air, SteamVR, RTX 5090, at 72 Hz. Other headsets and graphics cards should work through OpenXR but have not been tried, and that includes Virtual Desktop's OpenXR runtime. Reports are welcome.
+- Tested in real headsets on two setups: Pimax Dream Air through SteamVR, and Meta Quest 3 through Virtual Desktop's VDXR. Other headsets and graphics cards should work through OpenXR but have not been tried. Reports are welcome.
 - There is no DLSS. The game is 32-bit, and DLSS needs a 64-bit game.
 - The mod stops the game's telemetry.
 - If something goes wrong, the log is `BepInEx\LogOutput.log` in the game folder. Please attach it to an issue.

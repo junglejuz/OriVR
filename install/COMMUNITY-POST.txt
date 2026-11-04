@@ -12,17 +12,16 @@ What it does
 
 What you need
 - The Steam version of Ori and the Blind Forest: Definitive Edition
-- A PC VR headset running through SteamVR, version 2.17 or newer
-- SteamVR set as your OpenXR runtime
+- A PC VR headset with a 32-bit OpenXR runtime: SteamVR 2.17 or newer set as your OpenXR runtime, or Virtual Desktop's VDXR
 - A gamepad
 
 Please read
-- It has been tested in a real headset on one setup only: Pimax Dream Air, SteamVR, RTX 5090, at 72 Hz. Other headsets and graphics cards should work but have not been tried, and that includes Virtual Desktop's OpenXR runtime. Reports are welcome.
+- Tested in real headsets on two setups: Pimax Dream Air through SteamVR, and Meta Quest 3 through Virtual Desktop's VDXR. Other headsets and graphics cards should work but have not been tried. Reports are welcome.
 - There is no DLSS. The game is 32-bit, and DLSS needs a 64-bit game.
 - The mod is not signed, so Windows may warn you, and Smart App Control can block it. The README covers this.
 
 Install
-Unzip it, double click "Install OriVR.bat", and type 1. Start SteamVR, then start Ori from Steam.
+Unzip it, double click "Install OriVR.bat", and type 1. Start SteamVR or connect Virtual Desktop, then start Ori from Steam.
 
 Download: https://github.com/scubasteve2365/OriVR/releases/tag/v1.0
 

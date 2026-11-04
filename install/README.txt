@@ -4,8 +4,7 @@ Native stereo, played with a gamepad, as a diorama floating in front of you.
 
 You need
 - The game on Steam.
-- A PC VR headset that runs through SteamVR, with SteamVR 2.17 or newer.
-- SteamVR set as your OpenXR runtime (SteamVR settings, OpenXR). The installer warns you if this looks missing.
+- A PC VR headset with a 32-bit OpenXR runtime. Tested: SteamVR 2.17 or newer, set as your OpenXR runtime in SteamVR settings, and Virtual Desktop's VDXR. The installer warns you if this looks missing.
 - A gamepad.
 
 Install
@@ -13,7 +12,7 @@ Install
 2. Double click "Install OriVR.bat" and type 1.
 
 Play
-1. Start SteamVR.
+1. Start SteamVR or connect Virtual Desktop.
 2. Start Ori from Steam. VR starts by itself. The game may freeze for a few seconds while it connects.
 3. Load a save. A stage floats in front of you.
 
@@ -31,14 +30,14 @@ Uninstall
 Double click "Install OriVR.bat" and type 2. No game files are changed by this mod.
 
 If something goes wrong
-- The game stays flat: check SteamVR is set as your OpenXR runtime. Then look in BepInEx\LogOutput.log in the game folder.
+- The game stays flat: check your OpenXR runtime is set (SteamVR or VDXR). Then look in BepInEx\LogOutput.log in the game folder.
 - Windows warns about the bat file: this mod is not signed, so Windows may ask you to confirm. Read the bat file first if you like. It is plain text.
 - Smart App Control: if it is on, Windows can block unsigned mod DLLs and the game runs flat. Windows does not make this easy to turn back on, so decide for yourself. There is no workaround in the mod.
 - When SteamVR starts, its dashboard may appear in front of the stage. Close it as usual.
 - Far backgrounds strain your eyes: lower Depth or raise Pop-out.
 
 Tested on
-Pimax Dream Air through SteamVR, RTX 5090, at 72 Hz. That is the only real headset tried so far. Others should work through OpenXR but have not been tried. AMD and Intel graphics have not been tried. Virtual Desktop's OpenXR runtime has not been tried with this 32-bit game.
+Pimax Dream Air through SteamVR, and Meta Quest 3 through Virtual Desktop's VDXR. Others should work through OpenXR but have not been tried. AMD and Intel graphics have not been tried.
 
 Known limits
 - Steam version only.
