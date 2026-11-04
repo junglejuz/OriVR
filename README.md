@@ -4,6 +4,8 @@ True stereo VR for Ori and the Blind Forest: Definitive Edition. Both eyes are d
 
 **Download:** see [Releases](../../releases).
 
+**Support:** Ori VR is free. If you enjoy it, you can [buy me a coffee](https://buymeacoffee.com/scubasteve2365).
+
 ## What you need
 
 - The Steam version of Ori and the Blind Forest: Definitive Edition
@@ -43,6 +45,11 @@ If far backgrounds strain your eyes, lower Depth or raise Pop-out.
 - There is no DLSS. The game is 32-bit, and DLSS needs a 64-bit game.
 - The mod stops the game's telemetry.
 - If something goes wrong, the log is `BepInEx\LogOutput.log` in the game folder. Please attach it to an issue.
+
+## Support
+
+Ori VR is free. If you enjoy it and want to support more VR mods, you can
+[buy me a coffee](https://buymeacoffee.com/scubasteve2365). Thank you!
 
 ## Building from source
 
