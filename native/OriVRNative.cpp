@@ -313,10 +313,93 @@ static void DoResize() {
     if (!CreateSwapchains()) { Log("resize failed, OpenXR stops"); g_state = StateFailed; }
 }
 
+// OpenXR add-ons (implicit API layers) load into every OpenXR program. One that only ships a 64-bit DLL cannot load
+// into this 32-bit game, and the loader then fails the whole start with XR_ERROR_FILE_ACCESS_ERROR (-32). Before the
+// loader starts, each implicit layer a 32-bit program would load is checked, and any whose DLL is not 32-bit is
+// switched off for this process only, with the variable the layer itself declares for that.
+static std::string JsonString(const std::string& text, const char* key) {
+    std::string k = std::string("\"") + key + "\"";
+    size_t at = text.find(k);
+    if (at == std::string::npos) return "";
+    at = text.find(':', at + k.size());
+    if (at == std::string::npos) return "";
+    at = text.find('"', at);
+    if (at == std::string::npos) return "";
+    std::string out;
+    for (size_t i = at + 1; i < text.size(); i++) {
+        char c = text[i];
+        if (c == '\\' && i + 1 < text.size()) { out += text[++i]; continue; }
+        if (c == '"') return out;
+        out += c;
+    }
+    return "";
+}
+
+// 0x14c for a 32-bit DLL, 0x8664 for 64-bit, 0 when the file cannot be read.
+static unsigned short DllMachine(const std::string& path) {
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") != 0 || !f) return 0;
+    unsigned char dos[64];
+    unsigned short machine = 0;
+    if (fread(dos, 1, 64, f) == 64 && dos[0] == 'M' && dos[1] == 'Z') {
+        long pe = *(long*)(dos + 60);
+        unsigned char sig[6];
+        if (fseek(f, pe, SEEK_SET) == 0 && fread(sig, 1, 6, f) == 6 && sig[0] == 'P' && sig[1] == 'E')
+            machine = (unsigned short)(sig[4] | (sig[5] << 8));
+    }
+    fclose(f);
+    return machine;
+}
+
+static void CheckLayers(HKEY root, const char* rootName) {
+    HKEY key;
+    if (RegOpenKeyExA(root, "SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit", 0, KEY_READ, &key) != ERROR_SUCCESS) return;
+    for (DWORD i = 0;; i++) {
+        char manifest[1024];
+        DWORD nameLen = sizeof(manifest), type = 0, data = 0, dataLen = sizeof(data);
+        LONG r = RegEnumValueA(key, i, manifest, &nameLen, nullptr, &type, (BYTE*)&data, &dataLen);
+        if (r == ERROR_NO_MORE_ITEMS) break;
+        if (r != ERROR_SUCCESS) continue;
+        if (type == REG_DWORD && data != 0) { Log("OpenXR layer %s (%s): switched off in Windows, skipped", manifest, rootName); continue; }
+        std::string text;
+        FILE* f = nullptr;
+        if (fopen_s(&f, manifest, "rb") == 0 && f) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+            fclose(f);
+        }
+        std::string name = JsonString(text, "name");
+        std::string lib = JsonString(text, "library_path");
+        std::string off = JsonString(text, "disable_environment");
+        std::string full = lib;
+        bool relative = !lib.empty() && !(lib.size() > 1 && lib[1] == ':') && lib[0] != '\\' && lib[0] != '/';
+        if (relative) {
+            std::string dir = manifest;
+            size_t slash = dir.find_last_of("\\/");
+            full = (slash == std::string::npos ? std::string() : dir.substr(0, slash + 1)) + lib;
+        }
+        unsigned short machine = full.empty() ? 0 : DllMachine(full);
+        const char* kind = machine == 0x14c ? "32-bit" : machine == 0x8664 ? "64-bit" : machine == 0 ? "unreadable" : "other";
+        if (machine == 0x14c) {
+            Log("OpenXR layer %s (%s): 32-bit, kept", name.c_str(), rootName);
+        } else if (!off.empty()) {
+            SetEnvironmentVariableA(off.c_str(), "1");
+            Log("OpenXR layer %s (%s): DLL is %s, switched off for this game (%s=1). %s", name.c_str(), rootName, kind, off.c_str(), full.c_str());
+        } else {
+            Log("OpenXR layer %s (%s): DLL is %s and the layer has no off switch, OpenXR may fail. %s", name.c_str(), rootName, kind, full.c_str());
+        }
+    }
+    RegCloseKey(key);
+}
+
 static bool StartXr() {
     char path[MAX_PATH];
     HereDir(path, MAX_PATH);
     strcat_s(path, "openxr_loader.dll");
+    // A 32-bit program reads the 32-bit view of HKLM. HKCU\Software is shared by both.
+    CheckLayers(HKEY_LOCAL_MACHINE, "HKLM");
+    CheckLayers(HKEY_CURRENT_USER, "HKCU");
     g_loader = LoadLibraryA(path);
     if (!g_loader) { Log("could not load %s, error %lu", path, GetLastError()); return false; }
     g_gipa = (PFN_xrGetInstanceProcAddr)GetProcAddress(g_loader, "xrGetInstanceProcAddr");

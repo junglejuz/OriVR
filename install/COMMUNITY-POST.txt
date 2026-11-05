@@ -1,4 +1,4 @@
-OriVR 1.0: Ori and the Blind Forest: Definitive Edition in VR (free mod, OpenXR)
+OriVR 1.1: Ori and the Blind Forest: Definitive Edition in VR (free mod, OpenXR)
 
 Ori as a floating 3D diorama in front of you. This is true native stereo: both eyes are drawn from the same game tick, with no alternate-eye rendering and no warping. The game's real depth layers stay real, so the background sits behind the stage and the foreground comes out toward you. Play it seated with a gamepad.
 
@@ -23,6 +23,6 @@ Please read
 Install
 Unzip it, double click "Install OriVR.bat", and type 1. Start SteamVR or connect Virtual Desktop, then start Ori from Steam.
 
-Download: https://github.com/scubasteve2365/OriVR/releases/tag/v1.0
+Download: https://github.com/scubasteve2365/OriVR/releases/tag/v1.1
 
 By scubasteve2365. MIT licence. Uses BepInEx and the Khronos OpenXR loader. This is a fan mod, not made or approved by Moon Studios or Xbox Game Studios.
