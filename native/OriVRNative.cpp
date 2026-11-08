@@ -4,12 +4,15 @@
 //   Main thread   OriXR_BeginFrame: poll events, xrWaitFrame (paces the game), xrLocateViews.
 //   Render thread render events from GL.IssuePluginEvent: create the session, then begin, copy, end each frame.
 //
-// Each eye image shows the game's flat rectangle seen from that eye. It goes to the headset as a quad layer visible
-// to one eye only, placed at a fixed spot in the room: the "stage". Errors are logged, never fatal: a failed OpenXR
-// start leaves the game running flat.
+// Each eye image shows the game's flat rectangle seen from that eye, placed at a fixed spot in the room: the "stage".
+// By default each eye image is drawn onto the stage's rectangle inside that eye's full view, with the eye pose and lens
+// it was rendered from, and sent as one projection layer. The original path sends it as a quad layer visible to one
+// eye only; under Virtual Desktop those quads squash and shear when the head moves. Errors are logged, never fatal: a
+// failed OpenXR start leaves the game running flat.
 #include <windows.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -42,7 +45,7 @@ struct FrameInfo {
 
 // The eye textures travel with each frame, each holding a reference: Unity can recreate its textures at any time,
 // for example when the game changes resolution, so a pointer saved earlier can go stale.
-struct PendingFrame { XrTime displayTime; XrDuration period; bool shouldRender; ID3D11Texture2D* src[2]; };
+struct PendingFrame { XrTime displayTime; XrDuration period; bool shouldRender; ID3D11Texture2D* src[2]; bool viewsValid; XrPosef pose[2]; XrFovf fov[2]; };
 
 static std::mutex g_logLock;
 static std::deque<std::string> g_log;
@@ -86,12 +89,24 @@ static ID3D11Buffer* g_cb;
 static ID3D11SamplerState* g_sampler;
 static ID3D11Texture2D* g_passTex[2];
 static ID3D11RenderTargetView* g_passRtv[2];
+static pD3DCompile g_compile;
+// In-eye stage pass: the eye image drawn onto the stage rectangle in each eye's full view (projection layer).
+static volatile LONG g_layerMode = 1;  // 1 = projection layer drawn in the eyes, 0 = the original per-eye quads
+static LONG g_loggedMode = -1;
+static ID3D11VertexShader* g_stageVs;
+static ID3D11PixelShader* g_stagePs;
+static ID3D11Buffer* g_stageCb;
+static ID3D11SamplerState* g_linear;
+static ID3D11RasterizerState* g_noCull;
 static std::mutex g_frameLock;
 static std::deque<PendingFrame> g_frames;
 static unsigned long long g_submitted, g_submittedLayers, g_skippedAcquire;
 
 struct Swap { XrSwapchain handle; std::vector<XrSwapchainImageD3D11KHR> images; };
 static Swap g_swap[2];
+static Swap g_proj[2];
+static std::vector<ID3D11RenderTargetView*> g_projRtv[2];
+static int g_projW, g_projH;
 
 static PFN_xrPollEvent p_poll;
 static PFN_xrBeginSession p_beginSession;
@@ -152,6 +167,7 @@ static bool CreateSharpenPass() {
     if (!compilerDll) { Log("sharpen off: no d3dcompiler_47.dll"); return false; }
     auto compile = (pD3DCompile)GetProcAddress(compilerDll, "D3DCompile");
     if (!compile) return false;
+    g_compile = compile;
     ID3DBlob* vsBlob = nullptr; ID3DBlob* psBlob = nullptr; ID3DBlob* err = nullptr;
     size_t len = strlen(g_shader);
     if (FAILED(compile(g_shader, len, "sharpen", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsBlob, &err)) ||
@@ -195,7 +211,7 @@ static void CreatePassTargets() {
         td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;  // the in-eye stage pass samples it
         if (FAILED(g_dev->CreateTexture2D(&td, nullptr, &g_passTex[e]))) continue;
         D3D11_RENDER_TARGET_VIEW_DESC rv{};
         rv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -239,7 +255,7 @@ static ID3D11Texture2D* Sharpen(int e, ID3D11Texture2D* src) {
 }
 
 // Lab: writes the exact pixels going to the headset as a BMP, so the sharpen pass can be measured.
-static void DumpImage(int e, ID3D11Texture2D* tex) {
+static void DumpImage(const char* tag, int e, ID3D11Texture2D* tex) {
     D3D11_TEXTURE2D_DESC td;
     tex->GetDesc(&td);
     td.Usage = D3D11_USAGE_STAGING;
@@ -252,7 +268,7 @@ static void DumpImage(int e, ID3D11Texture2D* tex) {
     D3D11_MAPPED_SUBRESOURCE map;
     if (SUCCEEDED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
         char path[MAX_PATH + 16];
-        sprintf_s(path, "%s_%d.bmp", g_dumpPath, e);
+        sprintf_s(path, "%s%s_%d.bmp", g_dumpPath, tag, e);
         FILE* f = nullptr;
         if (fopen_s(&f, path, "wb") == 0 && f) {
             BITMAPFILEHEADER fh{};
@@ -279,7 +295,7 @@ static void DumpImage(int e, ID3D11Texture2D* tex) {
                 fwrite(row.data(), 1, row.size(), f);
             }
             fclose(f);
-            Log("DUMP eye %d written, %ux%u, sharpen %.2f", e, td.Width, td.Height, (float)g_sharpen);
+            Log("DUMP%s eye %d written, %ux%u, sharpen %.2f", tag, e, td.Width, td.Height, (float)g_sharpen);
         }
         g_ctx->Unmap(staging, 0);
     }
@@ -303,6 +319,178 @@ static bool CreateSwapchains() {
     }
     Log("swapchains %dx%d, %zu images per eye", g_w, g_h, g_swap[0].images.size());
     CreatePassTargets();
+    return true;
+}
+
+// Draws the eye image as a rectangle given by four clip-space corners (top left, top right, bottom left, bottom right).
+// The hardware interpolates the texture coordinates with perspective, so the picture lies flat on the stage.
+static const char* g_stageShader = R"(
+Texture2D src : register(t0);
+SamplerState linearClamp : register(s0);
+cbuffer Stage : register(b0) { float4 corner[4]; };
+void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD0) {
+    uv = float2(id & 1, id >> 1);
+    pos = corner[id];
+}
+float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    return float4(src.Sample(linearClamp, uv).rgb, 1);
+}
+)";
+
+static bool CreateStagePass() {
+    if (!g_compile || !g_passState) { Log("in-eye stage off: no shader compiler or context state, quads are used"); return false; }
+    ID3DBlob* vsBlob = nullptr; ID3DBlob* psBlob = nullptr; ID3DBlob* err = nullptr;
+    size_t len = strlen(g_stageShader);
+    if (FAILED(g_compile(g_stageShader, len, "stage", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vsBlob, &err)) ||
+        FAILED(g_compile(g_stageShader, len, "stage", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &psBlob, &err))) {
+        Log("in-eye stage off: shader error %s", err ? (const char*)err->GetBufferPointer() : "unknown");
+        return false;
+    }
+    g_dev->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_stageVs);
+    g_dev->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_stagePs);
+    D3D11_BUFFER_DESC cb{};
+    cb.ByteWidth = 64;
+    cb.Usage = D3D11_USAGE_DEFAULT;
+    cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    g_dev->CreateBuffer(&cb, nullptr, &g_stageCb);
+    D3D11_SAMPLER_DESC sd{};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    g_dev->CreateSamplerState(&sd, &g_linear);
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    g_dev->CreateRasterizerState(&rd, &g_noCull);
+    return g_stageVs && g_stagePs && g_stageCb && g_linear && g_noCull;
+}
+
+static bool CreateProjectionSwapchains() {
+    if (g_recW <= 0 || g_recH <= 0) { Log("in-eye stage off: the runtime gave no eye size, quads are used"); return false; }
+    g_projW = g_recW;
+    g_projH = g_recH;
+    for (int e = 0; e < 2; e++) {
+        XrSwapchainCreateInfo c{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        c.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        c.format = g_format;
+        c.sampleCount = 1;
+        c.width = g_projW;
+        c.height = g_projH;
+        c.faceCount = c.arraySize = c.mipCount = 1;
+        XRCHECK(p_createSwap(g_sess, &c, &g_proj[e].handle));
+        uint32_t ic = 0;
+        XRCHECK(p_enumImages(g_proj[e].handle, 0, &ic, nullptr));
+        g_proj[e].images.assign(ic, XrSwapchainImageD3D11KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+        XRCHECK(p_enumImages(g_proj[e].handle, ic, &ic, (XrSwapchainImageBaseHeader*)g_proj[e].images.data()));
+        g_projRtv[e].assign(ic, nullptr);
+    }
+    Log("in-eye stage ready: eye views %dx%d, %zu images per eye", g_projW, g_projH, g_proj[0].images.size());
+    return true;
+}
+
+struct V3 { float x, y, z; };
+static V3 Rotate(const XrQuaternionf& q, V3 v) {
+    // v + w t + u x t, with t = 2 (u x v) and u = (x, y, z)
+    V3 t{2 * (q.y * v.z - q.z * v.y), 2 * (q.z * v.x - q.x * v.z), 2 * (q.x * v.y - q.y * v.x)};
+    return {v.x + q.w * t.x + (q.y * t.z - q.z * t.y), v.y + q.w * t.y + (q.z * t.x - q.x * t.z), v.z + q.w * t.z + (q.x * t.y - q.y * t.x)};
+}
+
+// The stage's four corners in the eye's clip space: room -> eye (inverse of the located eye pose) -> the eye's lens.
+static void StageCorners(const XrPosef& eye, const XrFovf& fov, float out[16]) {
+    XrQuaternionf stageTurn{0, g_stage[5], 0, g_stage[6]};
+    XrQuaternionf inv{-eye.orientation.x, -eye.orientation.y, -eye.orientation.z, eye.orientation.w};
+    float hw = g_stage[3] * 0.5f, hh = g_stage[4] * 0.5f;
+    const V3 local[4] = {{-hw, hh, 0}, {hw, hh, 0}, {-hw, -hh, 0}, {hw, -hh, 0}};
+    float l = tanf(fov.angleLeft), r = tanf(fov.angleRight), u = tanf(fov.angleUp), d = tanf(fov.angleDown);
+    const float n = 0.05f, f = 100.0f;
+    for (int i = 0; i < 4; i++) {
+        V3 w = Rotate(stageTurn, local[i]);
+        V3 rel{g_stage[0] + w.x - eye.position.x, g_stage[1] + w.y - eye.position.y, g_stage[2] + w.z - eye.position.z};
+        V3 v = Rotate(inv, rel);  // eye space: x right, y up, looking down -z
+        out[i * 4 + 0] = (2 * v.x + (l + r) * v.z) / (r - l);
+        out[i * 4 + 1] = (2 * v.y + (u + d) * v.z) / (u - d);
+        out[i * 4 + 2] = (f / (f - n)) * -v.z - f * n / (f - n);
+        out[i * 4 + 3] = -v.z;
+    }
+}
+
+// Draws the eye image onto the stage inside the eye's full view and fills one projection view. The pose and lens are
+// the ones this eye image was rendered from, so the runtime's correction for late head motion matches the picture.
+static bool DrawEye(int e, ID3D11Texture2D* src, const PendingFrame& f, XrCompositionLayerProjectionView& view) {
+    D3D11_TEXTURE2D_DESC td;
+    if (!src) { Log("eye %d has no texture this frame", e); return false; }
+    src->GetDesc(&td);
+    if ((int)td.Width != g_w || (int)td.Height != g_h) { Log("eye %d texture is %ux%u, expected %dx%d", e, td.Width, td.Height, g_w, g_h); return false; }
+    uint32_t idx = 0;
+    XrResult r = p_acquire(g_proj[e].handle, nullptr, &idx);
+    if (XR_FAILED(r)) { Log("acquire failed: %d", (int)r); return false; }
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = 100000000;  // 100 ms
+    r = p_waitImage(g_proj[e].handle, &wi);
+    if (r != XR_SUCCESS) { Log("wait image: %d", (int)r); if (XR_FAILED(r)) { p_release(g_proj[e].handle, nullptr); return false; } }
+
+    ID3D11Texture2D* image = Sharpen(e, src);
+    bool srgb = g_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    // Read and written with the same encoding, so the bytes reaching the headset are the ones the quads carried.
+    ID3D11RenderTargetView*& rtv = g_projRtv[e][idx];
+    if (!rtv) {
+        D3D11_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        HRESULT hr = g_dev->CreateRenderTargetView(g_proj[e].images[idx].texture, &rv, &rtv);
+        if (FAILED(hr)) Log("eye %d view target failed: %08lx", e, (unsigned long)hr);
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    ID3D11ShaderResourceView* srv = nullptr;
+    bool ok = rtv && SUCCEEDED(g_dev->CreateShaderResourceView(image, &sv, &srv));
+    if (ok) {
+        float corners[16];
+        StageCorners(f.pose[e], f.fov[e], corners);
+        ID3DDeviceContextState* unityState = nullptr;
+        g_ctx1->SwapDeviceContextState(g_passState, &unityState);
+        // Every piece of state is set here: the private state keeps whatever the last pass left in it.
+        const float black[4] = {0, 0, 0, 1};
+        g_ctx->ClearRenderTargetView(rtv, black);
+        g_ctx->UpdateSubresource(g_stageCb, 0, nullptr, corners, 0, 0);
+        D3D11_VIEWPORT vp{0, 0, (float)g_projW, (float)g_projH, 0, 1};
+        g_ctx->RSSetViewports(1, &vp);
+        g_ctx->RSSetState(g_noCull);
+        g_ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        g_ctx->OMSetDepthStencilState(nullptr, 0);
+        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        g_ctx->IASetInputLayout(nullptr);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        g_ctx->VSSetShader(g_stageVs, nullptr, 0);
+        g_ctx->VSSetConstantBuffers(0, 1, &g_stageCb);
+        g_ctx->PSSetShader(g_stagePs, nullptr, 0);
+        g_ctx->PSSetSamplers(0, 1, &g_linear);
+        g_ctx->PSSetShaderResources(0, 1, &srv);
+        g_ctx->Draw(4, 0);
+        ID3D11ShaderResourceView* noSrv = nullptr;
+        ID3D11RenderTargetView* noRtv = nullptr;
+        g_ctx->PSSetShaderResources(0, 1, &noSrv);
+        g_ctx->OMSetRenderTargets(1, &noRtv, nullptr);
+        g_ctx1->SwapDeviceContextState(unityState, nullptr);
+        if (unityState) unityState->Release();
+        srv->Release();
+        if (g_dumpWanted) {
+            DumpImage("", e, image);
+            DumpImage("_view", e, g_proj[e].images[idx].texture);
+            if (e == 1) g_dumpWanted = 0;
+        }
+    }
+    p_release(g_proj[e].handle, nullptr);
+    if (!ok) return false;
+
+    view = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+    view.pose = f.pose[e];
+    view.fov = f.fov[e];
+    view.subImage.swapchain = g_proj[e].handle;
+    view.subImage.imageRect.extent = {g_projW, g_projH};
     return true;
 }
 
@@ -497,6 +685,7 @@ static bool StartXr() {
     }
     CreateSharpenPass();
     if (!CreateSwapchains()) return false;
+    if (!CreateStagePass() || !CreateProjectionSwapchains()) g_projW = 0;
 
     return GetFn("xrPollEvent", p_poll) && GetFn("xrBeginSession", p_beginSession) && GetFn("xrEndSession", p_endSession) &&
            GetFn("xrWaitFrame", p_waitFrame) && GetFn("xrBeginFrame", p_beginFrame) && GetFn("xrEndFrame", p_endFrame) &&
@@ -532,7 +721,7 @@ static bool CopyEye(int e, ID3D11Texture2D* src, XrCompositionLayerQuad& quad) {
     ID3D11Texture2D* finalImage = Sharpen(e, src);
     g_ctx->CopySubresourceRegion(g_swap[e].images[idx].texture, 0, 0, 0, 0, finalImage, 0, nullptr);
     if (g_dumpWanted) {
-        DumpImage(e, finalImage);
+        DumpImage("", e, finalImage);
         if (e == 1) g_dumpWanted = 0;
     }
     p_release(g_swap[e].handle, nullptr);
@@ -560,9 +749,27 @@ static void DoSubmit() {
     XrResult r = p_beginFrame(g_sess, nullptr);
     if (XR_FAILED(r)) { Log("xrBeginFrame failed: %d", (int)r); ReleaseFrame(f); return; }
     XrCompositionLayerQuad quads[2];
+    XrCompositionLayerProjectionView views[2];
+    XrCompositionLayerProjection proj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     const XrCompositionLayerBaseHeader* layers[2];
     uint32_t count = 0;
-    if (f.shouldRender) {
+    LONG mode = (g_layerMode && g_projW > 0 && f.viewsValid) ? 1 : 0;
+    if (f.shouldRender && mode != g_loggedMode) {
+        g_loggedMode = mode;
+        if (mode) Log("LAYER projection: stage drawn in the eyes, %dx%d per eye", g_projW, g_projH);
+        else Log("LAYER quads: stage as one floating panel per eye (%s)", !g_layerMode ? "chosen" : g_projW <= 0 ? "in-eye pass unavailable" : "no head tracking");
+    }
+    if (f.shouldRender && mode) {
+        if (DrawEye(0, f.src[0], f, views[0]) && DrawEye(1, f.src[1], f, views[1])) {
+            proj.space = g_space;
+            proj.viewCount = 2;
+            proj.views = views;
+            layers[0] = (XrCompositionLayerBaseHeader*)&proj;
+            count = 1;
+        } else {
+            g_skippedAcquire++;
+        }
+    } else if (f.shouldRender) {
         if (CopyEye(0, f.src[0], quads[0]) && CopyEye(1, f.src[1], quads[1])) {
             layers[0] = (XrCompositionLayerBaseHeader*)&quads[0];
             layers[1] = (XrCompositionLayerBaseHeader*)&quads[1];
@@ -590,6 +797,14 @@ static void DoShutdown() {
         if (GetFn("xrDestroyInstance", destroy)) destroy(g_inst);  // takes the session, spaces and swapchains with it
     }
     for (auto& sw : g_swap) sw.handle = XR_NULL_HANDLE;
+    for (int e = 0; e < 2; e++) {
+        for (auto& v : g_projRtv[e]) if (v) v->Release();
+        g_projRtv[e].clear();
+        g_proj[e].handle = XR_NULL_HANDLE;
+        g_proj[e].images.clear();
+    }
+    g_projW = 0;
+    g_loggedMode = -1;
     g_inst = XR_NULL_HANDLE;
     g_sess = XR_NULL_HANDLE;
     g_space = XR_NULL_HANDLE;
@@ -619,6 +834,7 @@ API void OriXR_SetSize(int width, int height) { g_newW = width; g_newH = height;
 API void OriXR_SetSharpen(float amount) { g_sharpen = amount; }
 API void OriXR_DumpNext(const char* basePath) { strcpy_s(g_dumpPath, basePath); g_dumpWanted = 1; }
 API int OriXR_RecommendedWidth() { return g_recW; }
+API void OriXR_SetLayerMode(int mode) { g_layerMode = mode ? 1 : 0; }
 
 // Call on the main thread before the init event. The textures must already exist in the Unity player.
 API void OriXR_Start(void* left, void* right, int width, int height) {
@@ -664,12 +880,7 @@ API int OriXR_BeginFrame(FrameInfo* out, void* left, void* right) {
     out->running = 1;
     out->shouldRender = fs.shouldRender ? 1 : 0;
     out->periodMs = (float)(fs.predictedDisplayPeriod / 1e6);
-    {
-        std::lock_guard<std::mutex> l(g_frameLock);
-        PendingFrame f{fs.predictedDisplayTime, fs.predictedDisplayPeriod, fs.shouldRender != 0, {(ID3D11Texture2D*)left, (ID3D11Texture2D*)right}};
-        for (auto t : f.src) if (t) t->AddRef();
-        g_frames.push_back(f);
-    }
+    PendingFrame f{fs.predictedDisplayTime, fs.predictedDisplayPeriod, fs.shouldRender != 0, {(ID3D11Texture2D*)left, (ID3D11Texture2D*)right}, false};
     if (fs.shouldRender) {
         XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
         li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -681,12 +892,21 @@ API int OriXR_BeginFrame(FrameInfo* out, void* left, void* right) {
         r = p_locate(g_sess, &li, &vs, 2, &vc, views);
         if (XR_SUCCEEDED(r) && vc == 2 && (vs.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
             out->viewsValid = 1;
+            f.viewsValid = (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
             for (int e = 0; e < 2; e++) {
+                f.pose[e] = views[e].pose;
+                f.fov[e] = views[e].fov;
                 auto& p = views[e].pose;
                 out->eye[e] = {p.position.x, p.position.y, p.position.z, p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w,
                                views[e].fov.angleLeft, views[e].fov.angleRight, views[e].fov.angleUp, views[e].fov.angleDown};
             }
         }
+    }
+    {
+        // The eye images for this frame are rendered from these same views, so they travel together.
+        std::lock_guard<std::mutex> l(g_frameLock);
+        for (auto t : f.src) if (t) t->AddRef();
+        g_frames.push_back(f);
     }
     return 1;
 }

@@ -13,7 +13,7 @@ namespace OriVR
         static readonly Color Gold = new Color(1f, 0.82f, 0.45f, 1f);
         static readonly Color Dim = new Color(0.75f, 0.78f, 0.8f, 1f);
         static readonly Color Title = new Color(0.72f, 0.9f, 1f, 1f);
-        const int Rows = 9;  // distance, size, depth, pop-out, sharpen, resolution, recenter, defaults, close
+        const int Rows = 10;  // distance, size, depth, pop-out, sharpen, resolution, picture, recenter, defaults, close
 
         internal XrRig Rig;
         internal Action<int, int> Adjust;  // row, direction
@@ -204,7 +204,7 @@ namespace OriVR
             lastSelected = selected;
         }
 
-        static float RowY(int row) { return 1.8f - row * 0.48f; }
+        static float RowY(int row) { return 1.8f - row * 0.43f; }
 
         void Update()
         {

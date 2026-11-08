@@ -35,6 +35,7 @@ Click both sticks at once to open the menu in the headset. The game pauses while
 | Pop-out | Brings more of the scene toward you, and eases far backgrounds |
 | Sharpen | Crisper edges. Too high looks harsh |
 | Resolution | 100% matches your headset. Higher costs speed and adds little in this game |
+| Picture | "Steady" draws the stage inside each eye's view, so it stays still when you move your head. "Floating panel" is the older way, which Virtual Desktop squashes and shears |
 | Recenter | Puts the stage in front of you again |
 
 If far backgrounds strain your eyes, lower Depth or raise Pop-out.

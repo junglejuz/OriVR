@@ -24,6 +24,7 @@ Up and down choose a setting. Left and right change it. A selects. B closes.
 - Pop-out: moves more of the scene out toward you. It also eases far backgrounds.
 - Sharpen: crisper edges. Too high looks harsh.
 - Resolution: 100% matches your headset. Higher costs speed and adds little in this game.
+- Picture: "steady" draws the stage inside each eye's view, so it stays still when you move your head. "floating panel" is the older way; Virtual Desktop squashes and shears it.
 - Recenter: puts the stage in front of you again.
 
 Uninstall

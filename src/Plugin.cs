@@ -30,7 +30,7 @@ namespace OriVR
         ConfigEntry<float> sharpness, popOut, sharpen;
         LabTools lab;
         const float DefaultWidth = 1.85f, DefaultDistance = 1.0f, DefaultDepth = 1.5f, DefaultSharpen = 0.3f;
-        ConfigEntry<bool> matchRefresh;
+        ConfigEntry<bool> matchRefresh, drawInEyes;
         MenuUI menu;
         int ticks;
         int nextCommandCheck;
@@ -63,6 +63,8 @@ namespace OriVR
             matchRefresh = Config.Bind("VR", "MatchRefresh", true, "Run one game tick per headset frame, at whatever rate OpenXR reports.");
             rig.Sharpness = sharpness.Value;
             rig.MatchRefresh = matchRefresh.Value;
+            drawInEyes = Config.Bind("VR", "DrawInEyes", true, "Draw the stage inside each eye's view, so it stays still when you move your head. Off shows it as one floating panel per eye, as before; Virtual Desktop squashes and shears those.");
+            rig.DrawInEyes = drawInEyes.Value;
             menu = gameObject.AddComponent<MenuUI>();
             menu.Rig = rig;
             menu.RowText = MenuRowText;
@@ -75,7 +77,7 @@ namespace OriVR
             rig.EyeWidth = eyeWidth.Value;
             rig.EyeHeight = eyeWidth.Value * 9 / 16;
             new Harmony("com.scubasteve2365.orivr").PatchAll(typeof(Plugin).Assembly);
-            Log.LogInfo("OriVR 1.1 (build 10) loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
+            Log.LogInfo("OriVR 1.1 + steady picture (build 10t) loaded. Unity " + Application.unityVersion + ", pointer size " + IntPtr.Size);
         }
 
         void FixedUpdate() { ticks++; Ticks = ticks; }
@@ -109,8 +111,9 @@ namespace OriVR
                 case 3: return string.Format("Pop-out: {0:F0}%", popOut.Value * 100f);
                 case 4: return string.Format("Sharpen: {0:F0}%", sharpen.Value * 100f);
                 case 5: return string.Format("Resolution: {0:F0}%   ({1} pixels wide)", sharpness.Value * 100f, rig.WantedWidth());
-                case 6: return "Recenter";
-                case 7: return "Reset to defaults";
+                case 6: return drawInEyes.Value ? "Picture: steady" : "Picture: floating panel (old)";
+                case 7: return "Recenter";
+                case 8: return "Reset to defaults";
                 default: return "Close";
             }
         }
@@ -123,19 +126,25 @@ namespace OriVR
             else if (row == 3) popOut.Value = Mathf.Clamp(popOut.Value + dir * 0.05f, 0f, 1f);
             else if (row == 4) sharpen.Value = Mathf.Clamp(sharpen.Value + dir * 0.1f, 0f, 1f);
             else if (row == 5) sharpness.Value = Mathf.Clamp(sharpness.Value + dir * 0.1f, 0.5f, 1.5f);
+            else if (row == 6) drawInEyes.Value = !drawInEyes.Value;
             else return;
             PushSettings();
-            Log.LogInfo(string.Format("MENU stage {0:F2} m wide at {1:F2} m, depth {2:F2}, pop-out {3:F2}, sharpen {4:F2}, resolution {5:F2}", stageWidth.Value, stageDistance.Value, separation.Value, popOut.Value, sharpen.Value, sharpness.Value));
+            Log.LogInfo(string.Format("MENU stage {0:F2} m wide at {1:F2} m, depth {2:F2}, pop-out {3:F2}, sharpen {4:F2}, resolution {5:F2}, picture in eyes {6}", stageWidth.Value, stageDistance.Value, separation.Value, popOut.Value, sharpen.Value, sharpness.Value, drawInEyes.Value));
         }
 
         void MenuActivate(int row)
         {
             if (row == 6)
             {
+                MenuAdjust(6, 1);
+                menu.Refresh();
+            }
+            else if (row == 7)
+            {
                 rig.Recenter();
                 Log.LogInfo("MENU recenter");
             }
-            else if (row == 7)
+            else if (row == 8)
             {
                 stageDistance.Value = DefaultDistance;
                 stageWidth.Value = DefaultWidth;
@@ -143,11 +152,12 @@ namespace OriVR
                 popOut.Value = 0f;
                 sharpen.Value = DefaultSharpen;
                 sharpness.Value = 1f;
+                drawInEyes.Value = true;
                 PushSettings();
                 menu.Refresh();
                 Log.LogInfo("MENU defaults");
             }
-            else if (row == 8) menu.Close();
+            else if (row == 9) menu.Close();
         }
 
         void PushSettings()
@@ -158,6 +168,7 @@ namespace OriVR
             rig.Sharpness = sharpness.Value;
             rig.PopOut = popOut.Value;
             rig.Sharpen = sharpen.Value;
+            rig.DrawInEyes = drawInEyes.Value;
             rig.ApplyStage();
         }
 
@@ -193,6 +204,7 @@ namespace OriVR
                 else if (line.StartsWith("scenes ")) lab.ListScenes(line.Substring(7));
                 else if (line.StartsWith("goto ")) lab.GoTo(line.Substring(5));
                 else if (line.StartsWith("crossfade ")) lab.CrossFade(float.Parse(line.Substring(10), System.Globalization.CultureInfo.InvariantCulture));
+                else if (line == "layer 0" || line == "layer 1") { drawInEyes.Value = line == "layer 1"; PushSettings(); }
                 else if (line == "menu") { if (menu.IsOpen) menu.Close(); else menu.Open(); }
                 else if (line.StartsWith("rate "))
                 {

@@ -42,6 +42,7 @@ namespace OriVR
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int BeginFrameFn(out FrameInfo info, IntPtr left, IntPtr right);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int PopLogFn(StringBuilder buffer, int size);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void StatsFn(out uint frames, out uint layers, out uint skipped);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SetLayerModeFn(int mode);
 
         GetRenderEventFn OriXR_GetRenderEvent;
         StateFn OriXR_State;
@@ -54,6 +55,7 @@ namespace OriVR
         BeginFrameFn OriXR_BeginFrame;
         PopLogFn OriXR_PopLog;
         StatsFn OriXR_Stats;
+        SetLayerModeFn OriXR_SetLayerMode;  // missing in older OriVRNative builds
 
         static T Fn<T>(IntPtr module, string name) where T : class
         {
@@ -70,6 +72,9 @@ namespace OriVR
         internal float Sharpen = 0.3f;       // strength of the sharpen pass, 0 is off
         internal bool StereoFixes = true;    // lab switch: the second-eye fixes below
         internal bool MatchRefresh = true;   // run one game tick per headset frame
+        // Draw the stage into each eye's full view (one projection layer) instead of one floating panel per eye. Virtual
+        // Desktop squashes and shears the per-eye panels when the head moves.
+        internal bool DrawInEyes = true;
 
         // Where the viewer was when the stage was placed, and which way they faced. Eye poses are read relative to this.
         Vector3 viewPoint;
@@ -124,6 +129,8 @@ namespace OriVR
             OriXR_BeginFrame = Fn<BeginFrameFn>(module, "OriXR_BeginFrame");
             OriXR_PopLog = Fn<PopLogFn>(module, "OriXR_PopLog");
             OriXR_Stats = Fn<StatsFn>(module, "OriXR_Stats");
+            var layerFn = GetProcAddress(module, "OriXR_SetLayerMode");
+            if (layerFn != IntPtr.Zero) OriXR_SetLayerMode = Marshal.GetDelegateForFunctionPointer(layerFn, typeof(SetLayerModeFn)) as SetLayerModeFn;
             renderEvent = OriXR_GetRenderEvent();
             nativeLoaded = true;
             return true;
@@ -282,7 +289,8 @@ namespace OriVR
         {
             if (!nativeLoaded) return;
             OriXR_SetSharpen(Sharpen);
-            var c = viewPoint + viewTurn * new Vector3(0f, 0f, -StageDistance);
+            if (OriXR_SetLayerMode != null) OriXR_SetLayerMode(DrawInEyes ? 1 : 0);
+            var c =viewPoint + viewTurn * new Vector3(0f, 0f, -StageDistance);
             OriXR_SetStage(c.x, c.y, c.z, StageWidth, StageWidth * EyeHeight / EyeWidth, viewTurn.y, viewTurn.w);
         }
 
@@ -337,7 +345,9 @@ namespace OriVR
                     continue;
                 }
                 MatchTick(info.periodMs);
-                if (info.viewsValid != 0 && wantRecenter)
+                // Place the stage only once the session is FOCUSED (5): before that, Virtual Desktop reports a stand-in
+                // head pose (x 0, z 0, facing 0, 1.1-1.6 m below the real head) marked valid, and the stage landed there.
+                if (info.viewsValid != 0 && wantRecenter && info.sessionState == 5)
                 {
                     wantRecenter = false;
                     TakeView(info);
